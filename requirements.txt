@@ -1,0 +1,31 @@
+# Python 3.12 required (PyTorch/Ultralytics don't support 3.14 yet)
+
+# Core ML / detection
+ultralytics>=8.3.0          # YOLOv8
+torch>=2.2.0                # CPU build is fine locally; training happens on Colab
+torchvision>=0.17.0
+
+# Tracking
+supervision>=0.22.0         # ByteTrack + annotators
+
+# Computer vision
+opencv-python>=4.9.0
+numpy>=1.26.0
+scikit-learn>=1.4.0         # KMeans for team color clustering
+scikit-image>=0.22.0        # background removal helpers
+
+# Data
+pandas>=2.2.0               # ball interpolation
+
+# Annotation (local web UI)
+label-studio>=1.11.0
+
+# Optional: Intel GPU inference acceleration (install only if you want OpenVINO)
+# openvino>=2024.0.0
+# openvino-dev>=2024.0.0
+
+# Dev
+tqdm>=4.66.0
+pyyaml>=6.0.1
+matplotlib>=3.8.0
+jupyter>=1.0.0
