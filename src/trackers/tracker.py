@@ -31,7 +31,10 @@ TrackFrame = dict[str, dict[int, dict]]
 
 
 # Minimum confidence per class. Ball is lower because it's small and flickery.
-DEFAULT_CONF = {"player": 0.3, "goalkeeper": 0.3, "referee": 0.3, "ball": 0.15}
+# COCO's generic "sports ball" class rarely exceeds 0.15 for broadcast football —
+# we keep the threshold low in COCO mode so we at least get *some* ball triangles;
+# the custom-trained model will have genuinely confident ball detections at 0.3+.
+DEFAULT_CONF = {"player": 0.3, "goalkeeper": 0.3, "referee": 0.3, "ball": 0.05}
 
 
 @dataclass
@@ -49,8 +52,10 @@ class ClassMap:
 
     @classmethod
     def custom(cls) -> "ClassMap":
-        # Roboflow football-players-detection order.
-        return cls(player=[0], goalkeeper=[1], referee=[2], ball=[3])
+        # Roboflow football-players-detection-3zvbc v20 order (confirmed from data.yaml):
+        #   0: ball, 1: goalkeeper, 2: player, 3: referee
+        # If you re-train on a dataset with a different order, update this.
+        return cls(player=[2], goalkeeper=[1], referee=[3], ball=[0])
 
     def name_of(self, cls_id: int) -> str | None:
         for name, ids in (

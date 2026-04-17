@@ -30,6 +30,7 @@ def run(
     read_from_stub: bool,
     max_frames: int | None,
     start_frame: int,
+    imgsz: int,
 ) -> None:
     info = get_video_info(input_path)
     print(
@@ -42,7 +43,7 @@ def run(
     print(f"  loaded {len(frames)} frames")
 
     # --- Phase 4: detection + tracking -------------------------------------
-    tracker = Tracker(model_path=model_path, mode=mode)
+    tracker = Tracker(model_path=model_path, mode=mode, imgsz=imgsz)
     tracks = tracker.get_object_tracks(
         frames,
         read_from_stub=read_from_stub,
@@ -98,6 +99,12 @@ def main() -> None:
         help="Process at most N frames (dev affordance — CPU inference is slow)",
     )
     p.add_argument("--start-frame", type=int, default=0)
+    p.add_argument(
+        "--imgsz",
+        type=int,
+        default=1280,
+        help="YOLO inference size. Lower = faster, worse at small objects (ball).",
+    )
     args = p.parse_args()
 
     run(
@@ -109,6 +116,7 @@ def main() -> None:
         read_from_stub=args.use_stub,
         max_frames=args.max_frames,
         start_frame=args.start_frame,
+        imgsz=args.imgsz,
     )
 
 

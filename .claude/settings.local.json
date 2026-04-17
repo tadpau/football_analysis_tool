@@ -4,7 +4,8 @@
       "Bash(py -0)",
       "Bash(.venv/Scripts/python.exe scripts/verify_env.py)",
       "Bash(.venv/Scripts/python.exe -m pip install --upgrade pip)",
-      "Bash(.venv/Scripts/python.exe -m pip install -r requirements.txt)"
+      "Bash(.venv/Scripts/python.exe -m pip install -r requirements.txt)",
+      "Bash(.venv/Scripts/python.exe main.py --input \"video_clips/Įrašas 2026-04-16 205545.mp4\" --output \"output_videos/preview_10s.mp4\" --model models/yolov8m.pt --mode coco --max-frames 300 --imgsz 960 --stub stubs/preview_10s.pkl)"
     ]
   }
 }

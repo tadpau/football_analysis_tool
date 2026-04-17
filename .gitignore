@@ -16,6 +16,7 @@ env/
 *.onnx
 *.xml
 *.bin
+*.mp4
 runs/
 wandb/
 
@@ -26,8 +27,7 @@ data/dataset/images/
 data/dataset/labels/
 stubs/*.pkl
 stubs/*.joblib
-output_videos/*.mp4
-output_videos/*.avi
+output_videos/
 
 # IDE
 .vscode/
