@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
 
 from ..db.connection import open_db
 from .repository import MatchSummary, get_match, list_matches
+from .track_mapping_panel import TrackMappingPanel
 from .video_widget import VideoWidget
 
 
@@ -190,41 +191,27 @@ class TaggerWidget(QWidget):
             frame_height=match.frame_height,
             n_frames=match.n_frames,
         )
-        self._video.player_clicked.connect(self._on_player_clicked)
 
-        # Right sidebar — placeholders for Phase 2c/2d panels. We lay out
-        # the structure now so the window proportions don't change later
-        # when the real panels land.
-        self._sidebar = QWidget()
-        self._sidebar.setFixedWidth(320)
-        self._sidebar.setStyleSheet("background-color: #1f1f1f; color: #ccc;")
-        sidebar_layout = QVBoxLayout(self._sidebar)
-        sidebar_layout.setContentsMargins(12, 12, 12, 12)
-        sidebar_layout.addWidget(QLabel(
-            f"<b>{match.home_team}</b> vs <b>{match.away_team}</b>"
-            f"<br>{match.match_date} &middot; {match.season}"
-        ))
-        self._selection_label = QLabel("Selected: <i>none</i>")
-        self._selection_label.setWordWrap(True)
-        sidebar_layout.addWidget(self._selection_label)
-        sidebar_layout.addStretch(1)
-        sidebar_layout.addWidget(QLabel(
-            "<i>Track mapping and hotkey panel arrive in the next "
-            "iteration. For now: scrub through the video, click a "
-            "player to confirm hit-testing works.</i>"
-        ))
+        self._panel = TrackMappingPanel(connection, match)
+        # Push existing roster mappings into the video so labels appear
+        # the moment the tagger view opens (rather than only after the
+        # next mapping change).
+        self._video.set_track_labels(self._panel.get_track_labels())
+
+        # Click on video → forward to panel for assignment.
+        self._video.player_clicked.connect(self._panel.set_selected_track)
+        # Panel changed mappings → repush labels into the video overlay.
+        self._panel.mappings_changed.connect(self._on_mappings_changed)
+        # Panel list-click → highlight that track on the video.
+        self._panel.track_chosen_in_list.connect(self._video.select_track)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._video, stretch=1)
-        layout.addWidget(self._sidebar)
+        layout.addWidget(self._panel)
 
-    def _on_player_clicked(self, track_id: int) -> None:
-        self._selection_label.setText(
-            f"Selected: <b>track {track_id}</b><br>"
-            f"<small>(Phase 2c will let you map this to a roster "
-            f"player by typing a kit number.)</small>"
-        )
+    def _on_mappings_changed(self) -> None:
+        self._video.set_track_labels(self._panel.get_track_labels())
 
 
 # ---------------------------------------------------------------------------

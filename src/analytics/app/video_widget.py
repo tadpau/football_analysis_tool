@@ -137,15 +137,22 @@ def _draw_ellipse(img, p: FramePlayerPos, color, label: str | None) -> None:
         angle=0.0, startAngle=-45, endAngle=235,
         color=color, thickness=2, lineType=cv2.LINE_4,
     )
-    if label:
-        rect_w, rect_h = 36, 18
-        rx1 = int(cx - rect_w / 2)
-        ry1 = int(p.bbox_y2 + 5)
-        cv2.rectangle(img, (rx1, ry1), (rx1 + rect_w, ry1 + rect_h), color, cv2.FILLED)
-        cv2.putText(
-            img, label, (rx1 + 4, ry1 + rect_h - 4),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2,
-        )
+    if not label:
+        return
+    # Width-adaptive label box — short labels (just a track id) stay
+    # narrow; mapped labels like "10 Petras" need more horizontal room.
+    # Estimate text width via font metrics (cv2 returns size in px).
+    font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2
+    (tw, th), _ = cv2.getTextSize(label, font, scale, thick)
+    rect_w = max(36, tw + 10)
+    rect_h = max(18, th + 8)
+    rx1 = int(cx - rect_w / 2)
+    ry1 = int(p.bbox_y2 + 5)
+    cv2.rectangle(img, (rx1, ry1), (rx1 + rect_w, ry1 + rect_h), color, cv2.FILLED)
+    cv2.putText(
+        img, label, (rx1 + 5, ry1 + rect_h - 5),
+        font, scale, (0, 0, 0), thick,
+    )
 
 
 def _draw_ball(img, b: FrameBallPos) -> None:
@@ -172,17 +179,23 @@ def render_overlays(
     players: list[FramePlayerPos],
     ball: FrameBallPos | None,
     selected_track_id: int | None,
+    track_labels: dict[int, str] | None = None,
 ) -> np.ndarray:
-    """Draw player ellipses + ball triangle + track-id labels on a
-    BGR frame. Returns a NEW ndarray; doesn't modify input.
+    """Draw player ellipses + ball triangle + labels on a BGR frame.
 
-    A selected track gets a yellow halo so the operator has visual
-    confirmation of who they clicked.
+    ``track_labels`` is the override map ``{track_id: 'kit name'}`` from
+    the TrackMappingPanel. When a track has a roster mapping, its label
+    becomes the kit + name; otherwise it falls back to the raw
+    ``track_id``. A selected track gets a yellow halo so the operator
+    has visual confirmation of who they clicked.
+
+    Returns a NEW ndarray; doesn't modify input.
     """
     canvas = bgr.copy()
+    labels = track_labels or {}
     for p in players:
         color = _color_for(p)
-        label = str(p.track_id)
+        label = labels.get(p.track_id) or str(p.track_id)
         _draw_ellipse(canvas, p, color, label)
         if p.track_id == selected_track_id and p.cls != "ball":
             cx = int((p.bbox_x1 + p.bbox_x2) * 0.5)
@@ -240,6 +253,9 @@ class VideoWidget(QWidget):
             raise RuntimeError(f"Could not open video: {video_path}")
         self._current_frame_number = 0
         self._selected_track_id: int | None = None
+        # Map of track_id -> "kit name" pushed in by the main window
+        # whenever the TrackMappingPanel updates.
+        self._track_labels: dict[int, str] = {}
 
         # ---- Widgets ----
         self._surface = VideoSurface(self)
@@ -322,6 +338,12 @@ class VideoWidget(QWidget):
         self._selected_track_id = track_id
         self.show_frame(self._current_frame_number)  # repaint with halo
 
+    def set_track_labels(self, labels: dict[int, str]) -> None:
+        """Push a fresh ``track_id -> 'kit name'`` map. Triggers a repaint
+        so newly mapped names appear immediately."""
+        self._track_labels = dict(labels)
+        self.show_frame(self._current_frame_number)
+
     # ---------------------------------------------------------- rendering
     def show_frame(self, frame_number: int) -> None:
         if frame_number < 0 or frame_number >= self._n_frames:
@@ -336,7 +358,10 @@ class VideoWidget(QWidget):
         self._current_frame_number = frame_number
 
         players, ball = get_frame_state(self._con, self._match_id, frame_number)
-        rendered = render_overlays(bgr, players, ball, self._selected_track_id)
+        rendered = render_overlays(
+            bgr, players, ball, self._selected_track_id,
+            track_labels=self._track_labels,
+        )
         self._surface.show_frame(rendered)
 
         # Update controls — guard against re-entrancy via blockSignals.

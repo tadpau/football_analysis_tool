@@ -178,3 +178,221 @@ def hit_test(
     if not candidates:
         return None
     return min(candidates, key=lambda p: (p.bbox_x2 - p.bbox_x1) * (p.bbox_y2 - p.bbox_y1))
+
+
+# ---------------------------------------------------------------------------
+# Team + roster CRUD (Phase 2c — track→player mapping)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TeamInfo:
+    """Resolved home/away team for a match — what the sidebar buttons show."""
+    id: int
+    name: str
+    is_home: bool
+
+
+@dataclass(frozen=True)
+class TrackMapping:
+    """One row of match_track_to_player joined with player + team."""
+    track_id: int
+    player_id: int
+    player_name: str
+    kit_number: int | None
+    team_side: int          # CV-detected side (1 or 2)
+    team_id: int            # roster team
+    team_name: str
+    is_home: bool
+
+
+def get_match_teams(con: sqlite3.Connection, match_id: int) -> tuple[TeamInfo, TeamInfo]:
+    """Return ``(home, away)`` team info for the match.
+
+    The ``is_home`` flag drives which "Assign to ..." button label the
+    sidebar shows — operator never has to remember which team_side maps
+    to which side of the schema.
+    """
+    row = con.execute(
+        """
+        SELECT m.home_team_id, m.away_team_id,
+               ht.name AS home_name, at.name AS away_name
+        FROM matches m
+        JOIN teams ht ON ht.id = m.home_team_id
+        JOIN teams at ON at.id = m.away_team_id
+        WHERE m.id = ?
+        """,
+        (match_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"No match with id={match_id}")
+    return (
+        TeamInfo(id=row["home_team_id"], name=row["home_name"], is_home=True),
+        TeamInfo(id=row["away_team_id"], name=row["away_name"], is_home=False),
+    )
+
+
+def dominant_team_side(
+    con: sqlite3.Connection, match_id: int, track_id: int,
+) -> int | None:
+    """Return the team_side (1 or 2) the track was MOST OFTEN classified
+    as during the match, or None if every position lacks a team.
+
+    Used to suggest home-vs-away to the operator — kit colour usually
+    makes this obvious in the rendered overlay, so we just preview the
+    CV's best guess. Operator confirms by clicking Home or Away.
+    """
+    row = con.execute(
+        """
+        SELECT team, COUNT(*) AS n
+        FROM frame_player_positions p
+        JOIN frames f ON f.id = p.frame_id
+        WHERE f.match_id = ? AND p.track_id = ? AND p.team IS NOT NULL
+        GROUP BY team
+        ORDER BY n DESC
+        LIMIT 1
+        """,
+        (match_id, track_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return int(row["team"])
+
+
+def list_track_mappings(
+    con: sqlite3.Connection, match_id: int,
+) -> list[TrackMapping]:
+    """All track→player mappings already recorded for this match."""
+    rows = con.execute(
+        """
+        SELECT mtp.track_id, mtp.player_id, mtp.team_side,
+               mtp.kit_number_in_match,
+               COALESCE(p.first_name || ' ' || p.last_name,
+                        p.first_name, p.last_name,
+                        '#' || COALESCE(mtp.kit_number_in_match,
+                                        p.default_kit_number, 'X'))
+                   AS player_name,
+               t.id AS team_id, t.name AS team_name,
+               (t.id = m.home_team_id) AS is_home
+        FROM match_track_to_player mtp
+        JOIN players p ON p.id = mtp.player_id
+        JOIN teams   t ON t.id = p.team_id
+        JOIN matches m ON m.id = mtp.match_id
+        WHERE mtp.match_id = ?
+        ORDER BY mtp.track_id
+        """,
+        (match_id,),
+    ).fetchall()
+    return [
+        TrackMapping(
+            track_id=r["track_id"],
+            player_id=r["player_id"],
+            player_name=r["player_name"],
+            kit_number=r["kit_number_in_match"],
+            team_side=r["team_side"],
+            team_id=r["team_id"],
+            team_name=r["team_name"],
+            is_home=bool(r["is_home"]),
+        )
+        for r in rows
+    ]
+
+
+def get_track_labels(
+    con: sqlite3.Connection, match_id: int,
+) -> dict[int, str]:
+    """Compact ``{track_id: 'kit name'}`` dict the video widget renders."""
+    out: dict[int, str] = {}
+    for m in list_track_mappings(con, match_id):
+        kit = m.kit_number if m.kit_number is not None else "?"
+        # Truncate name to keep label short — overlays sit close together.
+        name = m.player_name.strip()
+        if len(name) > 12:
+            name = name[:11] + "…"
+        out[m.track_id] = f"{kit} {name}"
+    return out
+
+
+def get_or_create_player(
+    con: sqlite3.Connection,
+    *,
+    team_id: int,
+    kit_number: int | None,
+    name: str | None,
+) -> int:
+    """Return the ``players.id`` for (team, kit). Creates one if missing.
+
+    The (team_id, default_kit_number) UNIQUE constraint means kit 10 on
+    a given team exists at most once in the roster — repeated assigns
+    of "track 47, kit 10, home" all link to the same player row.
+
+    ``name`` is only used when CREATING a new player. Existing rows
+    keep whatever name they already have; renaming is a separate
+    operation (UI doesn't expose that yet — direct SQL for now).
+    """
+    if kit_number is not None:
+        row = con.execute(
+            "SELECT id FROM players "
+            "WHERE team_id = ? AND default_kit_number = ?",
+            (team_id, kit_number),
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+
+    # Split a free-text "Petras Petrauskas" name into first / last on the
+    # first space. Single-token names go to first_name.
+    first, last = None, None
+    if name:
+        n = name.strip()
+        if " " in n:
+            first, last = n.split(" ", 1)
+        else:
+            first = n
+
+    cur = con.execute(
+        "INSERT INTO players (team_id, default_kit_number, first_name, last_name) "
+        "VALUES (?, ?, ?, ?)",
+        (team_id, kit_number, first, last),
+    )
+    return int(cur.lastrowid)
+
+
+def assign_track_to_player(
+    con: sqlite3.Connection,
+    *,
+    match_id: int,
+    track_id: int,
+    player_id: int,
+    team_side: int,
+    kit_number_in_match: int | None,
+) -> None:
+    """Insert (or replace) the ``match_track_to_player`` row.
+
+    Replacing on conflict means the operator can re-assign a track
+    (mistake, kit changed mid-match, …) just by repeating the action —
+    the latest assignment wins.
+    """
+    con.execute(
+        """
+        INSERT INTO match_track_to_player
+            (match_id, track_id, player_id, team_side, kit_number_in_match)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(match_id, track_id) DO UPDATE SET
+            player_id = excluded.player_id,
+            team_side = excluded.team_side,
+            kit_number_in_match = excluded.kit_number_in_match
+        """,
+        (match_id, track_id, player_id, team_side, kit_number_in_match),
+    )
+    con.commit()
+
+
+def unassign_track(
+    con: sqlite3.Connection, match_id: int, track_id: int,
+) -> None:
+    """Drop a track mapping. The events table keeps any prior tags;
+    they're tied to track_ids, not player_ids."""
+    con.execute(
+        "DELETE FROM match_track_to_player WHERE match_id = ? AND track_id = ?",
+        (match_id, track_id),
+    )
+    con.commit()
