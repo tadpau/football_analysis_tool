@@ -1,47 +1,27 @@
 # Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
 .venv/
-venv/
-env/
-*.egg-info/
-.pytest_cache/
-.ipynb_checkpoints/
+__pycache__/
+*.pyc
 
-# ML artifacts
-*.pt
-*.onnx
-*.xml
-*.bin
-*.mp4
-runs/
-wandb/
-
-# Data (keep source clips + dataset structure, ignore generated content)
-data/raw_frames/
-data/annotations/*.json
-data/dataset/images/
-data/dataset/labels/
-stubs/*.pkl
-stubs/*.joblib
+# Heavy data — never commit
+video_clips/
 output_videos/
+stubs/
+frames_to_label/
+datasets/
+calibrations/*.json
 
-# IDE
-.vscode/
-.idea/
-*.swp
+# Model weights — too big for git, use Releases / LFS / Drive
+models/*.pt
+*.pt
 
-# OS
+# Notebooks runtime artefacts
+notebooks/runs/
+notebooks/wandb/
+*.cache
+
+# OS / editor cruft
 .DS_Store
 Thumbs.db
-
-# Don't ignore structure markers
-!data/raw_frames/.gitkeep
-!data/annotations/.gitkeep
-!data/dataset/.gitkeep
-!stubs/.gitkeep
-!output_videos/.gitkeep
-!models/.gitkeep
+.idea/
+.vscode/launch.json
