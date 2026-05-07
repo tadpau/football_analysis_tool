@@ -58,14 +58,42 @@ class MatchSelectorWidget(QWidget):
         layout.addWidget(header)
 
         if not matches:
-            empty = QLabel(
-                "No matches ingested yet. Run "
-                "<code>python scripts/ingest_match.py …</code> "
-                "to add one, then reopen the app."
+            # Empty DB — give the operator a copy-pasteable command rather
+            # than a vague hint. The scripts/ingest_match.py CLI requires
+            # several flags and a usage error from omitting them is the
+            # most likely first failure mode for a new user.
+            empty_title = QLabel("<h3>No matches ingested yet</h3>")
+            empty_title.setStyleSheet("color: #ccc;")
+            layout.addWidget(empty_title)
+
+            empty_hint = QLabel(
+                "Run the ingest CLI to add a match, then reopen this app."
+                "<br><br>"
+                "Required flags: <code>--stub --video --model-version "
+                "--club --season --home-team --away-team --match-date</code>"
+                "<br>"
+                "Use <code>--create-missing</code> on first run to auto-"
+                "create the club / season / team rows."
             )
-            empty.setWordWrap(True)
-            empty.setStyleSheet("color: #888;")
-            layout.addWidget(empty)
+            empty_hint.setWordWrap(True)
+            empty_hint.setStyleSheet("color: #888;")
+            layout.addWidget(empty_hint)
+
+            example = QLabel(
+                "<pre style='background:#1a1a1a; color:#ddd; padding:10px; "
+                "border-radius:4px;'>python scripts/ingest_match.py \\\n"
+                "    --stub stubs/&lt;clip&gt;_pass1.pkl \\\n"
+                "    --video video_clips/&lt;clip&gt;.mp4 \\\n"
+                "    --calibration calibrations/&lt;clip&gt;.json \\\n"
+                "    --model-version v6 \\\n"
+                "    --club \"Your Club\" --season \"2025-2026 U17\" \\\n"
+                "    --home-team \"Your U17\" --away-team \"Opponent\" \\\n"
+                "    --match-date 2026-04-12 --age-group U17 \\\n"
+                "    --create-missing</pre>"
+            )
+            example.setTextFormat(Qt.TextFormat.RichText)
+            example.setWordWrap(True)
+            layout.addWidget(example)
             layout.addStretch(1)
             return
 
