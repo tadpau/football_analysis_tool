@@ -11,6 +11,12 @@ frames_to_label/
 datasets/
 calibrations/*.json
 
+# Analytics DBs — local-only artefacts, contain match data
+data/
+*.db
+*.db-shm
+*.db-wal
+
 # Model weights — too big for git, use Releases / LFS / Drive
 models/*.pt
 *.pt
