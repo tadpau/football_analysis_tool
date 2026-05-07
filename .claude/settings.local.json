@@ -8,7 +8,28 @@
       "Bash(.venv/Scripts/python.exe main.py --input \"video_clips/Įrašas 2026-04-16 205545.mp4\" --output \"output_videos/preview_10s.mp4\" --model models/yolov8m.pt --mode coco --max-frames 300 --imgsz 960 --stub stubs/preview_10s.pkl)",
       "Bash(.venv/Scripts/python.exe -c \"from ultralytics import YOLO; m=YOLO\\('models/best.pt'\\); print\\('names:', m.names\\)\")",
       "Bash(.venv/Scripts/python.exe main.py --input \"video_clips/Įrašas 2026-04-16 205545.mp4\" --output \"output_videos/custom_10s.mp4\" --model models/best.pt --mode custom --max-frames 300 --imgsz 1280 --stub stubs/custom_10s.pkl)",
-      "Bash(.venv/Scripts/python.exe main.py --input \"video_clips/Įrašas 2026-04-16 205545.mp4\" --output \"output_videos/custom_10s_teams.mp4\" --model models/best.pt --mode custom --max-frames 300 --imgsz 1280 --stub stubs/custom_10s.pkl --use-stub)"
+      "Bash(.venv/Scripts/python.exe main.py --input \"video_clips/Įrašas 2026-04-16 205545.mp4\" --output \"output_videos/custom_10s_teams.mp4\" --model models/best.pt --mode custom --max-frames 300 --imgsz 1280 --stub stubs/custom_10s.pkl --use-stub)",
+      "Bash(.venv/Scripts/python.exe main.py --input \"video_clips/Įrašas 2026-04-16 210618.mp4\" --output \"output_videos/clip5_teams.mp4\" --model models/best.pt --mode custom --max-frames 300 --imgsz 1280 --stub stubs/clip5.pkl)",
+      "Bash(.venv/Scripts/python.exe scripts/inspect_stub.py stubs/clip5.pkl)",
+      "Bash(.venv/Scripts/python.exe main.py --input \"video_clips/Įrašas 2026-04-16 210618.mp4\" --output \"output_videos/clip5_filtered.mp4\" --model models/best.pt --mode custom --max-frames 300 --imgsz 1280 --stub stubs/clip5.pkl --use-stub)",
+      "Bash(.venv/Scripts/python.exe main.py --input \"video_clips/Įrašas 2026-04-16 211126.mp4\" --output \"output_videos/clip7_filtered.mp4\" --model models/best.pt --mode custom --max-frames 300 --imgsz 1280 --stub stubs/clip7.pkl)",
+      "Bash(.venv/Scripts/python.exe main.py --input \"video_clips/Įrašas 2026-04-16 211126.mp4\" --output \"output_videos/clip7_consensus.mp4\" --model models/best.pt --mode custom --max-frames 300 --imgsz 1280 --stub stubs/clip7.pkl --use-stub)",
+      "Bash(.venv/Scripts/python.exe main.py --input \"video_clips/Įrašas 2026-04-16 211126.mp4\" --output \"output_videos/clip7_owner_fix.mp4\" --model models/best.pt --mode custom --max-frames 300 --imgsz 1280 --stub stubs/clip7.pkl --use-stub)",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"from src.team_assigner import TeamAssigner; ta = TeamAssigner\\(\\); print\\('OK', ta.cluster_spread, ta.player_team\\)\")",
+      "Bash(python -c \"from src.team_assigner import TeamAssigner; from src.team_assigner.team_assigner import HISTORY_WINDOW, HYSTERESIS_RATIO, OUTLIER_SPREAD_MULT; print\\('HISTORY_WINDOW=', HISTORY_WINDOW\\); print\\('HYSTERESIS_RATIO=', HYSTERESIS_RATIO\\); print\\('OUTLIER_SPREAD_MULT=', OUTLIER_SPREAD_MULT\\)\")",
+      "Bash(\"C:\\\\Users\\\\Tadas\\\\Documents\\\\Football_analysis_tool\\\\.venv\\\\Scripts\\\\python.exe\" -c \"import scipy; print\\(scipy.__version__\\)\")",
+      "Bash(\".venv\\\\Scripts\\\\python.exe\" -c \"from src.team_stats import compute_dominant_teams, compute_team_distances, compute_team_heatmaps, save_team_heatmap_png; import numpy as np; from pathlib import Path; hm = np.random.rand\\(68, 105\\).astype\\('float32'\\) * 5; save_team_heatmap_png\\(hm, Path\\('output_videos/_smoke_heatmap.png'\\), title='smoke test'\\); print\\('OK'\\)\")",
+      "Bash(\".venv\\\\Scripts\\\\python.exe\" -c \"import ast; ast.parse\\(open\\('main.py'\\).read\\(\\)\\); print\\('main.py parses OK'\\)\")",
+      "Bash(\".venv\\\\Scripts\\\\python.exe\" scripts/find_annotation_candidates.py stubs/clip5.pkl --top 5)",
+      "Bash(\".venv\\\\Scripts\\\\python.exe\" scripts/find_annotation_candidates.py stubs/clip5.pkl --top 3 --frame-offset 1200)",
+      "Bash(\".venv\\\\Scripts\\\\python.exe\" scripts/dedupe_frames.py \"frames_to_label/VFA_KFM\" --dry-run)",
+      "Bash(\".venv\\\\Scripts\\\\python.exe\" scripts/dedupe_frames.py \"frames_to_label/VFA_KFM\" --dry-run --hamming 3)",
+      "Bash(\".venv\\\\Scripts\\\\python.exe\" -c \"import json; nb=json.load\\(open\\('notebooks/train_yolo_colab.ipynb',encoding='utf-8'\\)\\); print\\(len\\(nb['cells']\\),'cells'\\)\")",
+      "Bash('.venv\\\\Scripts\\\\python.exe' -c ' *)",
+      "Bash(\".venv\\\\Scripts\\\\python.exe\" _update_notebook.py)",
+      "Bash(\".venv\\\\Scripts\\\\python.exe\")",
+      "Bash(python -c \"import main; from src.utils import StreamingVideoWriter, iter_video_chunks, iter_video_frames; from src.trackers import Tracker, draw_one_frame; from src.team_assigner import TeamAssigner; from src.camera_movement import CameraMovementEstimator; ta = TeamAssigner\\(\\); print\\('attach_color_samples =', hasattr\\(ta, 'attach_color_samples'\\)\\); print\\('fit_from_samples =', hasattr\\(ta, 'fit_from_samples'\\)\\); print\\('assign_all_from_samples =', hasattr\\(ta, 'assign_all_from_samples'\\)\\); print\\('feed_chunk =', hasattr\\(Tracker, 'feed_chunk'\\)\\); print\\('finalize_tracks =', hasattr\\(Tracker, 'finalize_tracks'\\)\\); print\\('cam feed_chunk =', hasattr\\(CameraMovementEstimator, 'feed_chunk'\\)\\); print\\('main.run_streaming =', hasattr\\(main, 'run_streaming'\\)\\)\")"
     ]
   }
 }
