@@ -396,3 +396,54 @@ def unassign_track(
         (match_id, track_id),
     )
     con.commit()
+
+
+@dataclass(frozen=True)
+class RosterEntry:
+    """One row of the roster panel — a player + how many tracks in the
+    current match are already linked to them. The track count is the
+    operator's progress indicator: a goalkeeper might end up with 1-2
+    tracks across a match, an outfield player closer to 5-10."""
+    player_id: int
+    kit_number: int | None
+    name: str
+    track_count: int
+
+
+def list_roster_with_track_counts(
+    con: sqlite3.Connection, match_id: int, team_id: int,
+) -> list[RosterEntry]:
+    """Players on ``team_id`` plus a track-count for the given match.
+
+    Players are sorted by kit number (kits without a number sink to the
+    bottom). The roster panel renders this list as clickable rows.
+    """
+    rows = con.execute(
+        """
+        SELECT p.id, p.default_kit_number,
+               COALESCE(p.first_name || ' ' || p.last_name,
+                        p.first_name, p.last_name,
+                        '#' || COALESCE(p.default_kit_number, p.id))
+                   AS player_name,
+               (SELECT COUNT(*) FROM match_track_to_player mtp
+                WHERE mtp.match_id = ? AND mtp.player_id = p.id) AS track_count
+        FROM players p
+        WHERE p.team_id = ?
+        ORDER BY
+            CASE WHEN p.default_kit_number IS NULL THEN 1 ELSE 0 END,
+            p.default_kit_number,
+            p.id
+        """,
+        (match_id, team_id),
+    ).fetchall()
+    return [
+        RosterEntry(
+            player_id=r["id"],
+            kit_number=r["default_kit_number"],
+            name=r["player_name"].strip(),
+            track_count=r["track_count"],
+        )
+        for r in rows
+    ]
+
+
