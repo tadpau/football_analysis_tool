@@ -283,8 +283,11 @@ class MainWindow(QMainWindow):
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
+        # No keyboard shortcut on this — Esc is reserved for the
+        # event-tagger panel's "cancel current event flow" action.
+        # Going back to the match selector is a deliberate, low-frequency
+        # operation, so a toolbar click is fine.
         self._back_action = QAction("← Matches", self)
-        self._back_action.setShortcut(QKeySequence("Esc"))
         self._back_action.triggered.connect(self._show_selector)
         self._back_action.setEnabled(False)  # nothing to go back to initially
         toolbar.addAction(self._back_action)
