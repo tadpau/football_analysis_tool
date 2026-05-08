@@ -297,18 +297,41 @@ def list_track_mappings(
     ]
 
 
+@dataclass(frozen=True)
+class TrackLabel:
+    """Overlay-rendering payload for a mapped track.
+
+    ``expected_team_side`` is the CV-detected team the track had when
+    the operator assigned it. Used by the renderer to suppress the
+    name when the same track_id later resurfaces with the OPPOSITE
+    team's colour — that's ByteTrack reusing a freed ID for a new
+    physical player on the other team, and showing the original name
+    on it would actively mislead the operator.
+    """
+    text: str
+    expected_team_side: int
+
+
 def get_track_labels(
     con: sqlite3.Connection, match_id: int,
-) -> dict[int, str]:
-    """Compact ``{track_id: 'kit name'}`` dict the video widget renders."""
-    out: dict[int, str] = {}
+) -> dict[int, TrackLabel]:
+    """Compact ``{track_id: TrackLabel}`` dict the video widget renders.
+
+    The renderer should ONLY display the label when the current
+    frame's ``team`` matches ``expected_team_side`` (or when the
+    frame's team is None — too ambiguous to override).
+    """
+    out: dict[int, TrackLabel] = {}
     for m in list_track_mappings(con, match_id):
         kit = m.kit_number if m.kit_number is not None else "?"
         # Truncate name to keep label short — overlays sit close together.
         name = m.player_name.strip()
         if len(name) > 12:
             name = name[:11] + "…"
-        out[m.track_id] = f"{kit} {name}"
+        out[m.track_id] = TrackLabel(
+            text=f"{kit} {name}".strip(),
+            expected_team_side=m.team_side,
+        )
     return out
 
 

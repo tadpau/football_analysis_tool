@@ -43,7 +43,13 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .repository import FramePlayerPos, FrameBallPos, get_frame_state, hit_test
+from .repository import (
+    FramePlayerPos,
+    FrameBallPos,
+    TrackLabel,
+    get_frame_state,
+    hit_test,
+)
 
 
 # Overlay colours — match the existing main.py annotator look so
@@ -179,15 +185,25 @@ def render_overlays(
     players: list[FramePlayerPos],
     ball: FrameBallPos | None,
     selected_track_id: int | None,
-    track_labels: dict[int, str] | None = None,
+    track_labels: dict[int, TrackLabel] | None = None,
 ) -> np.ndarray:
     """Draw player ellipses + ball triangle + labels on a BGR frame.
 
-    ``track_labels`` is the override map ``{track_id: 'kit name'}`` from
-    the TrackMappingPanel. When a track has a roster mapping, its label
-    becomes the kit + name; otherwise it falls back to the raw
-    ``track_id``. A selected track gets a yellow halo so the operator
-    has visual confirmation of who they clicked.
+    ``track_labels`` is the override map ``{track_id: TrackLabel}`` from
+    the TrackMappingPanel. A track gets its mapped name ONLY when:
+
+      * the operator has assigned that track_id to a roster player, AND
+      * the current frame's CV-detected team matches the team_side the
+        mapping was stored with (or the current frame's team is None,
+        which we treat as "trust the mapping" rather than overriding).
+
+    The team-side gate is what catches ByteTrack ID reuse: if track 47
+    was Petras (team 1) early in the clip, then ByteTrack frees and
+    re-assigns 47 to a player on team 2 later, the renderer falls back
+    to "47" rather than mis-painting "10 Petras" on the wrong team.
+
+    A selected track gets a yellow halo so the operator has visual
+    confirmation of who they clicked.
 
     Returns a NEW ndarray; doesn't modify input.
     """
@@ -195,7 +211,13 @@ def render_overlays(
     labels = track_labels or {}
     for p in players:
         color = _color_for(p)
-        label = labels.get(p.track_id) or str(p.track_id)
+        mapped = labels.get(p.track_id)
+        if mapped is not None and (
+            p.team is None or p.team == mapped.expected_team_side
+        ):
+            label = mapped.text
+        else:
+            label = str(p.track_id)
         _draw_ellipse(canvas, p, color, label)
         if p.track_id == selected_track_id and p.cls != "ball":
             cx = int((p.bbox_x1 + p.bbox_x2) * 0.5)
@@ -253,9 +275,11 @@ class VideoWidget(QWidget):
             raise RuntimeError(f"Could not open video: {video_path}")
         self._current_frame_number = 0
         self._selected_track_id: int | None = None
-        # Map of track_id -> "kit name" pushed in by the main window
-        # whenever the TrackMappingPanel updates.
-        self._track_labels: dict[int, str] = {}
+        # Map of track_id -> TrackLabel pushed in by the main window
+        # whenever the TrackMappingPanel updates. Each TrackLabel carries
+        # both the display text and the team_side gate that prevents
+        # ByteTrack ID reuse from misnaming opposite-team players.
+        self._track_labels: dict[int, TrackLabel] = {}
 
         # ---- Widgets ----
         self._surface = VideoSurface(self)
@@ -338,9 +362,9 @@ class VideoWidget(QWidget):
         self._selected_track_id = track_id
         self.show_frame(self._current_frame_number)  # repaint with halo
 
-    def set_track_labels(self, labels: dict[int, str]) -> None:
-        """Push a fresh ``track_id -> 'kit name'`` map. Triggers a repaint
-        so newly mapped names appear immediately."""
+    def set_track_labels(self, labels: dict[int, TrackLabel]) -> None:
+        """Push a fresh ``track_id -> TrackLabel`` map. Triggers a
+        repaint so newly mapped names appear immediately."""
         self._track_labels = dict(labels)
         self.show_frame(self._current_frame_number)
 

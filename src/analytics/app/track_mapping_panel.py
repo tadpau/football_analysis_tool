@@ -49,6 +49,7 @@ from .repository import (
     MatchSummary,
     RosterEntry,
     TeamInfo,
+    TrackLabel,
     TrackMapping,
     assign_track_to_player,
     dominant_team_side,
@@ -212,17 +213,26 @@ class TrackMappingPanel(QWidget):
             self._unassign_btn.setEnabled(False)
         self._selected_label.setText(msg)
 
-    def get_track_labels(self) -> dict[int, str]:
+    def get_track_labels(self) -> dict[int, TrackLabel]:
         """For VideoWidget overlay rendering — only labels tracks that
         have been mapped to a roster player. Untagged tracks (and any
-        tracks on the OTHER team) keep showing their raw track_id."""
-        out: dict[int, str] = {}
+        tracks on the OTHER team) keep showing their raw track_id.
+
+        Returns ``TrackLabel`` instances carrying both the display text
+        AND the team_side stored at mapping time, so the renderer can
+        refuse to paint the label when ByteTrack later reuses the same
+        track_id for a player on the OPPOSITE team's colour.
+        """
+        out: dict[int, TrackLabel] = {}
         for m in list_track_mappings(self._con, self._match.id):
             kit = m.kit_number if m.kit_number is not None else "?"
             name = m.player_name.strip()
             if len(name) > 12:
                 name = name[:11] + "…"
-            out[m.track_id] = f"{kit} {name}".strip()
+            out[m.track_id] = TrackLabel(
+                text=f"{kit} {name}".strip(),
+                expected_team_side=m.team_side,
+            )
         return out
 
     # ---------------------------------------------------------- handlers
