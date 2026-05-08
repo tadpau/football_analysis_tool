@@ -433,6 +433,213 @@ class RosterEntry:
     track_count: int
 
 
+# ---------------------------------------------------------------------------
+# Events (Phase 2d — operator hotkey tagging)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class EventType:
+    """One row of the seeded ``event_types`` vocabulary."""
+    code: str
+    label: str
+    hotkey: str | None
+    has_success: bool
+    has_secondary: bool
+    sort_order: int
+
+
+@dataclass(frozen=True)
+class EventRow:
+    """One event joined with the roster for display in the recent-events
+    list. Player-name / kit fields are NULL when the track wasn't yet
+    mapped at the time the event was tagged — common during early-match
+    tagging before the operator has built up the roster."""
+    id: int
+    timestamp_ms: int
+    frame_number: int
+    event_type: str
+    event_label: str
+    primary_track_id: int | None
+    primary_player_name: str | None
+    primary_kit: int | None
+    secondary_track_id: int | None
+    secondary_player_name: str | None
+    secondary_kit: int | None
+    success: int | None
+    notes: str | None
+
+
+def list_event_types(con: sqlite3.Connection) -> list[EventType]:
+    """Read the seeded vocabulary. Stable across runs unless someone
+    INSERTs into ``event_types`` directly."""
+    rows = con.execute(
+        "SELECT code, label, hotkey, has_success, has_secondary, sort_order "
+        "FROM event_types ORDER BY sort_order, code"
+    ).fetchall()
+    return [
+        EventType(
+            code=r["code"],
+            label=r["label"],
+            hotkey=r["hotkey"],
+            has_success=bool(r["has_success"]),
+            has_secondary=bool(r["has_secondary"]),
+            sort_order=r["sort_order"],
+        )
+        for r in rows
+    ]
+
+
+def find_track_for_kit(
+    con: sqlite3.Connection,
+    *,
+    match_id: int,
+    team_side: int,
+    kit_number: int,
+) -> int | None:
+    """Resolve "kit 7 on team_side 1" to a track_id mapped to that
+    player. If multiple tracks are mapped to the same kit (the re-ID
+    case), the lowest track_id wins — arbitrary but stable.
+
+    Returns None if no roster mapping matches. The event tagger uses
+    this when the operator types a kit number for the secondary
+    player; if it returns None we save the event with secondary_track_id
+    NULL and a note so the operator can re-tag once they've mapped that
+    track later in the match.
+    """
+    row = con.execute(
+        """
+        SELECT mtp.track_id
+        FROM match_track_to_player mtp
+        JOIN players p ON p.id = mtp.player_id
+        WHERE mtp.match_id = ?
+          AND mtp.team_side = ?
+          AND p.default_kit_number = ?
+        ORDER BY mtp.track_id ASC
+        LIMIT 1
+        """,
+        (match_id, team_side, kit_number),
+    ).fetchone()
+    return int(row["track_id"]) if row else None
+
+
+def get_or_create_frame_id(
+    con: sqlite3.Connection, match_id: int, frame_number: int,
+) -> int | None:
+    """Look up the frames row for (match, frame_number). Used by the
+    event-insert path to populate ``events.frame_id``. Returns None if
+    that frame wasn't analysed (e.g. operator scrubbed past
+    n_frames_analysed) — the caller should refuse to save in that case."""
+    row = con.execute(
+        "SELECT id FROM frames WHERE match_id = ? AND frame_number = ?",
+        (match_id, frame_number),
+    ).fetchone()
+    return int(row["id"]) if row else None
+
+
+def insert_event(
+    con: sqlite3.Connection,
+    *,
+    match_id: int,
+    frame_id: int,
+    timestamp_ms: int,
+    event_type: str,
+    primary_track_id: int | None = None,
+    secondary_track_id: int | None = None,
+    success: int | None = None,
+    notes: str | None = None,
+) -> int:
+    """Append a new event row. Returns the new ``events.id``.
+
+    Spatial state at the moment of the event is implicitly available
+    via JOIN: ``SELECT * FROM frame_player_positions WHERE frame_id = ?``
+    gives every player's position at that moment — no need to denormalise
+    coordinates onto the event row itself.
+    """
+    cur = con.execute(
+        """
+        INSERT INTO events (
+            match_id, frame_id, timestamp_ms, event_type,
+            primary_track_id, secondary_track_id, success, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            match_id, frame_id, timestamp_ms, event_type,
+            primary_track_id, secondary_track_id, success, notes,
+        ),
+    )
+    con.commit()
+    return int(cur.lastrowid)
+
+
+def list_recent_events(
+    con: sqlite3.Connection, match_id: int, limit: int = 30,
+) -> list[EventRow]:
+    """Most recent (non-deleted) events first. Joins through to roster
+    so the UI can render names + kits without a second round-trip."""
+    rows = con.execute(
+        """
+        SELECT
+            e.id, e.timestamp_ms, e.event_type, e.success, e.notes,
+            e.primary_track_id, e.secondary_track_id,
+            f.frame_number,
+            et.label AS event_label,
+            COALESCE(p1.first_name || ' ' || p1.last_name,
+                     p1.first_name, p1.last_name) AS primary_name,
+            COALESCE(mtp1.kit_number_in_match, p1.default_kit_number) AS primary_kit,
+            COALESCE(p2.first_name || ' ' || p2.last_name,
+                     p2.first_name, p2.last_name) AS secondary_name,
+            COALESCE(mtp2.kit_number_in_match, p2.default_kit_number) AS secondary_kit
+        FROM events e
+        JOIN frames f ON f.id = e.frame_id
+        JOIN event_types et ON et.code = e.event_type
+        LEFT JOIN match_track_to_player mtp1
+               ON mtp1.match_id = e.match_id AND mtp1.track_id = e.primary_track_id
+        LEFT JOIN players p1 ON p1.id = mtp1.player_id
+        LEFT JOIN match_track_to_player mtp2
+               ON mtp2.match_id = e.match_id AND mtp2.track_id = e.secondary_track_id
+        LEFT JOIN players p2 ON p2.id = mtp2.player_id
+        WHERE e.match_id = ? AND e.deleted_at IS NULL
+        ORDER BY e.timestamp_ms DESC, e.id DESC
+        LIMIT ?
+        """,
+        (match_id, limit),
+    ).fetchall()
+    return [
+        EventRow(
+            id=r["id"],
+            timestamp_ms=r["timestamp_ms"],
+            frame_number=r["frame_number"],
+            event_type=r["event_type"],
+            event_label=r["event_label"],
+            primary_track_id=r["primary_track_id"],
+            primary_player_name=(r["primary_name"].strip()
+                                  if r["primary_name"] else None),
+            primary_kit=r["primary_kit"],
+            secondary_track_id=r["secondary_track_id"],
+            secondary_player_name=(r["secondary_name"].strip()
+                                    if r["secondary_name"] else None),
+            secondary_kit=r["secondary_kit"],
+            success=r["success"],
+            notes=r["notes"],
+        )
+        for r in rows
+    ]
+
+
+def soft_delete_event(con: sqlite3.Connection, event_id: int) -> None:
+    """Mark an event as deleted (sets ``deleted_at = CURRENT_TIMESTAMP``).
+
+    Soft-delete instead of DELETE so the audit trail survives — useful
+    if someone later disputes an event count, or for re-running stats
+    with deletions excluded vs included.
+    """
+    con.execute(
+        "UPDATE events SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (event_id,),
+    )
+    con.commit()
+
+
 def list_roster_with_track_counts(
     con: sqlite3.Connection, match_id: int, team_id: int,
 ) -> list[RosterEntry]:

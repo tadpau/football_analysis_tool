@@ -30,12 +30,14 @@ from PyQt6.QtWidgets import (
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QToolBar,
     QVBoxLayout,
     QWidget,
 )
 
 from ..db.connection import open_db
+from .event_panel import EventPanel
 from .repository import MatchSummary, get_match, list_matches
 from .track_mapping_panel import TrackMappingPanel
 from .video_widget import VideoWidget
@@ -192,26 +194,69 @@ class TaggerWidget(QWidget):
             n_frames=match.n_frames,
         )
 
-        self._panel = TrackMappingPanel(connection, match)
+        self._tracks_panel = TrackMappingPanel(connection, match)
+        self._events_panel = EventPanel(connection, match)
+        # Seed the events panel with whichever team is currently selected
+        # for tagging — used to resolve "kit 7" → track_id during event save.
+        self._events_panel.set_tagging_team_side(
+            1 if self._tracks_panel._tagging_team.is_home else 2  # noqa: SLF001
+        )
+
         # Push existing roster mappings into the video so labels appear
         # the moment the tagger view opens (rather than only after the
         # next mapping change).
-        self._video.set_track_labels(self._panel.get_track_labels())
+        self._video.set_track_labels(self._tracks_panel.get_track_labels())
 
-        # Click on video → forward to panel for assignment.
-        self._video.player_clicked.connect(self._panel.set_selected_track)
-        # Panel changed mappings → repush labels into the video overlay.
-        self._panel.mappings_changed.connect(self._on_mappings_changed)
-        # Panel list-click → highlight that track on the video.
-        self._panel.track_chosen_in_list.connect(self._video.select_track)
+        # ---- Cross-widget signal wiring ----
+        # Click on video → both panels see the selection. Players panel
+        # uses it for assignment; events panel uses it as the "primary
+        # actor" for the next hotkey press.
+        self._video.player_clicked.connect(self._on_video_player_clicked)
+        # Frame change → events panel needs to know which frame_id to
+        # attach future events to.
+        self._video.frame_changed.connect(self._events_panel.set_current_frame)
+        # Players panel changed mappings → repush labels into the video
+        # overlay AND tell the events panel about any new tagging-team flip.
+        self._tracks_panel.mappings_changed.connect(self._on_mappings_changed)
+        # Players panel team-radio flips → events panel needs the new side
+        # for its kit→track resolver.
+        self._tracks_panel._home_radio.toggled.connect(  # noqa: SLF001
+            self._on_tagging_team_changed
+        )
+        # Players-panel list click → highlight that track on the video.
+        self._tracks_panel.track_chosen_in_list.connect(self._video.select_track)
+        # Events panel: clicking a recent event → seek video to that frame.
+        self._events_panel.event_clicked.connect(self._video.show_frame)
+
+        # Tabbed sidebar — Players first (setup), Events second (tagging).
+        self._sidebar_tabs = QTabWidget()
+        self._sidebar_tabs.setFixedWidth(380)
+        self._sidebar_tabs.addTab(self._tracks_panel, "Players")
+        self._sidebar_tabs.addTab(self._events_panel, "Events")
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._video, stretch=1)
-        layout.addWidget(self._panel)
+        layout.addWidget(self._sidebar_tabs)
 
     def _on_mappings_changed(self) -> None:
-        self._video.set_track_labels(self._panel.get_track_labels())
+        self._video.set_track_labels(self._tracks_panel.get_track_labels())
+
+    def _on_video_player_clicked(self, track_id: int) -> None:
+        # Forward to both panels. Players panel does the
+        # set-selected-then-show-roster flow; events panel records who
+        # the actor of the next hotkey will be.
+        self._tracks_panel.set_selected_track(track_id)
+        labels = self._tracks_panel.get_track_labels()
+        label_obj = labels.get(track_id)
+        label_text = label_obj.text if label_obj else f"track {track_id}"
+        self._events_panel.set_selected_track(track_id, label_text)
+
+    def _on_tagging_team_changed(self) -> None:
+        # Players panel manages the radio internally; we just read the
+        # current state and propagate the side to the events panel.
+        side = 1 if self._tracks_panel._home_radio.isChecked() else 2  # noqa: SLF001
+        self._events_panel.set_tagging_team_side(side)
 
 
 # ---------------------------------------------------------------------------
