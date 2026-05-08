@@ -1,32 +1,38 @@
-"""Sidebar tab for hotkey event tagging (Phase 2d).
+"""Sidebar tab for hotkey event tagging — mouse-first workflow.
 
-Workflow:
+Operator never types kit numbers during tagging. The receiver (or
+fouled player, assister, tackled opponent, etc.) is captured by
+clicking them on the video, exactly the same way the primary actor
+was captured. Outcomes (success / fail) are still single-keypresses
+(``1`` / ``2``) for events that have a success/fail dimension.
 
-  1. Operator clicks a player on the video → primary track captured.
-  2. Operator presses a hotkey (e.g. ``p`` for pass).
-  3. An inline form appears with the fields that event_type needs:
-        * For ``has_secondary`` events (pass, cross, tackle, foul,
-          goal): "Receiver kit?" / "Tackled player kit?" / etc.
-        * For ``has_success`` events (pass, shot, dribble, tackle,
-          save): two buttons "Success" / "Failed", or 1/2 keys.
-  4. Operator types kit and/or hits 1/2, then Enter to save.
-  5. Event row written to DB; the recent-events list refreshes; form
-     hides; panel waits for the next hotkey.
+State machine
+-------------
+::
 
-Hotkeys are bound to the EventPanel widget with
-``ShortcutContext.WidgetWithChildrenShortcut`` so they don't fire
-when the operator is typing in the *Players* tab's kit / name inputs.
-The video widget itself doesn't take focus, so hotkey routing is
-seamless during normal "scrub-and-tag" flow.
+    IDLE
+      └─ click player on video       →  primary set, stay IDLE
+      └─ press event hotkey
+            ├─ event has_secondary   →  AWAITING_SECONDARY
+            │     └─ click receiver
+            │          ├─ event has_success → AWAITING_OUTCOME
+            │          └─ else              → save & back to IDLE
+            ├─ event has_success     →  AWAITING_OUTCOME
+            └─ neither               →  save & back to IDLE
 
-Recent events list is the "what did I just record" view. Click a
-row to (Phase 2d.1) jump the video to that frame; for now it's
-read-only with an Undo-last button at the bottom.
+    AWAITING_OUTCOME
+      └─ press 1 / 2                 →  save & back to IDLE
+      └─ press Esc                   →  cancel & back to IDLE
+
+After a save, the primary actor stays selected — common case is
+multiple events from the same player in quick succession (a dribble
+followed by a shot, etc.). The operator can simply press the next
+hotkey without re-clicking.
 """
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from enum import Enum
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut
@@ -35,21 +41,16 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QPushButton,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
 from .repository import (
-    EventRow,
     EventType,
     MatchSummary,
-    dominant_team_side,
-    find_track_for_kit,
     get_or_create_frame_id,
     insert_event,
     list_event_types,
@@ -59,140 +60,25 @@ from .repository import (
 
 
 # ---------------------------------------------------------------------------
-# Inline form for "new event in progress"
+# State machine for the in-progress event.
 # ---------------------------------------------------------------------------
-class NewEventForm(QFrame):
-    """Inline form shown when a hotkey fires; collects secondary +
-    success then either ``Save``s or ``Cancel``s."""
-
-    saved = pyqtSignal(dict)        # {"secondary_kit": int|None, "success": int|None}
-    cancelled = pyqtSignal()
-
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Raised)
-        self.setStyleSheet(
-            "NewEventForm { background-color: #232b34; border: 1px solid #3a4a5a; }"
-        )
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-
-        self._title = QLabel("")
-        self._title.setStyleSheet("font-weight: bold; font-size: 13px;")
-        layout.addWidget(self._title)
-
-        # Secondary-player input row — hidden when the event_type doesn't
-        # need one (throw-ins, corners, offsides).
-        self._secondary_row = QHBoxLayout()
-        self._secondary_label = QLabel("Receiver kit:")
-        self._secondary_input = QSpinBox()
-        self._secondary_input.setRange(0, 99)
-        self._secondary_input.setSpecialValueText(" ")
-        self._secondary_input.setFixedWidth(60)
-        self._secondary_row.addWidget(self._secondary_label)
-        self._secondary_row.addWidget(self._secondary_input)
-        self._secondary_row.addStretch(1)
-        self._secondary_widget = QWidget()
-        self._secondary_widget.setLayout(self._secondary_row)
-        layout.addWidget(self._secondary_widget)
-
-        # Success / fail row — shown only for has_success events.
-        success_row = QHBoxLayout()
-        self._success_label = QLabel("Outcome:")
-        self._success_btn = QPushButton("Success (1)")
-        self._fail_btn = QPushButton("Failed (2)")
-        self._success_btn.setCheckable(True)
-        self._fail_btn.setCheckable(True)
-        self._success_btn.clicked.connect(lambda: self._set_success(1))
-        self._fail_btn.clicked.connect(lambda: self._set_success(0))
-        success_row.addWidget(self._success_label)
-        success_row.addWidget(self._success_btn)
-        success_row.addWidget(self._fail_btn)
-        success_row.addStretch(1)
-        self._success_widget = QWidget()
-        self._success_widget.setLayout(success_row)
-        layout.addWidget(self._success_widget)
-
-        # Action buttons.
-        btn_row = QHBoxLayout()
-        btn_row.addStretch(1)
-        self._cancel_btn = QPushButton("Cancel (Esc)")
-        self._cancel_btn.clicked.connect(self.cancelled.emit)
-        self._save_btn = QPushButton("Save (Enter)")
-        self._save_btn.clicked.connect(self._on_save)
-        self._save_btn.setDefault(True)
-        btn_row.addWidget(self._cancel_btn)
-        btn_row.addWidget(self._save_btn)
-        layout.addLayout(btn_row)
-
-        self._success_value: int | None = None
-        self._has_success = False
-        self._has_secondary = False
-
-        # Single-keystroke shortcuts for outcome (1/2). Local to the form.
-        QShortcut(QKeySequence("1"), self,
-                  context=Qt.ShortcutContext.WidgetWithChildrenShortcut,
-                  activated=lambda: self._set_success(1))
-        QShortcut(QKeySequence("2"), self,
-                  context=Qt.ShortcutContext.WidgetWithChildrenShortcut,
-                  activated=lambda: self._set_success(0))
-        QShortcut(QKeySequence("Esc"), self,
-                  context=Qt.ShortcutContext.WidgetWithChildrenShortcut,
-                  activated=self.cancelled.emit)
-        QShortcut(QKeySequence("Return"), self,
-                  context=Qt.ShortcutContext.WidgetWithChildrenShortcut,
-                  activated=self._on_save)
-
-    def configure_for(self, event_type: EventType, primary_label: str) -> None:
-        """Reset the form for a new event of the given type."""
-        self._has_secondary = event_type.has_secondary
-        self._has_success = event_type.has_success
-        self._success_value = None
-        self._success_btn.setChecked(False)
-        self._fail_btn.setChecked(False)
-        self._secondary_input.setValue(0)
-        self._secondary_widget.setVisible(self._has_secondary)
-        self._success_widget.setVisible(self._has_success)
-        self._title.setText(
-            f"<span style='color:#9ad;'>New {event_type.label}</span> "
-            f"&nbsp;by&nbsp; {primary_label}"
-        )
-        # Auto-focus the most useful field.
-        if self._has_secondary:
-            self._secondary_input.setFocus()
-            self._secondary_input.selectAll()
-        else:
-            self._save_btn.setFocus()
-
-    def _set_success(self, value: int) -> None:
-        self._success_value = value
-        self._success_btn.setChecked(value == 1)
-        self._fail_btn.setChecked(value == 0)
-
-    def _on_save(self) -> None:
-        # If the event needs a success flag and the operator hasn't picked
-        # one, refuse to save — prompt by colouring the buttons.
-        if self._has_success and self._success_value is None:
-            self._success_btn.setStyleSheet("background-color: #6a3a3a;")
-            self._fail_btn.setStyleSheet("background-color: #6a3a3a;")
-            return
-        # Reset the warning highlight.
-        self._success_btn.setStyleSheet("")
-        self._fail_btn.setStyleSheet("")
-        kit_value = self._secondary_input.value()
-        secondary_kit = kit_value if (self._has_secondary and kit_value > 0) else None
-        self.saved.emit({
-            "secondary_kit": secondary_kit,
-            "success": self._success_value,
-        })
+class _State(Enum):
+    IDLE = "idle"
+    AWAITING_SECONDARY = "awaiting_secondary"
+    AWAITING_OUTCOME = "awaiting_outcome"
 
 
-# ---------------------------------------------------------------------------
-# EventPanel — the second sidebar tab.
-# ---------------------------------------------------------------------------
+# Banner colours per state — visual cue so the operator never guesses
+# which key the panel is listening for next.
+_BANNER_COLORS = {
+    _State.IDLE:               "#1a3a4a",   # quiet teal
+    _State.AWAITING_SECONDARY: "#5a3a1a",   # amber — "click the next player"
+    _State.AWAITING_OUTCOME:   "#1a5a3a",   # green — "press 1 or 2"
+}
+
+
 class EventPanel(QWidget):
-    """Hotkey reference + inline new-event form + recent-events list."""
+    """Mouse-first event tagging — second sidebar tab."""
 
     event_logged = pyqtSignal()
     event_clicked = pyqtSignal(int)   # frame_number — for video seek
@@ -207,15 +93,16 @@ class EventPanel(QWidget):
         self._con = connection
         self._match = match
         self._event_types = list_event_types(connection)
-        self._by_code = {et.code: et for et in self._event_types}
-        self._by_hotkey = {et.hotkey.lower(): et for et in self._event_types if et.hotkey}
 
-        # Per-tag operator state, refreshed by the main window.
-        self._selected_track: int | None = None
-        self._selected_label: str = "(no player selected)"
-        self._current_frame: int = 0
-        self._tagging_team_side: int | None = None  # filled by main window
+        # ---- state ----
+        self._state: _State = _State.IDLE
+        self._primary_track: int | None = None
+        self._primary_label: str = ""
+        self._secondary_track: int | None = None
+        self._secondary_label: str = ""
         self._pending_event: EventType | None = None
+        self._current_frame: int = 0
+        self._tagging_team_side: int | None = None
 
         self.setFixedWidth(380)
         self.setStyleSheet(
@@ -230,20 +117,23 @@ class EventPanel(QWidget):
         outer.setContentsMargins(12, 12, 12, 12)
         outer.setSpacing(10)
 
-        # ---- Selected-track strip ----
-        self._selected_label_widget = QLabel(
-            "<i>Click a player on the video, then press a hotkey.</i>"
-        )
-        self._selected_label_widget.setTextFormat(Qt.TextFormat.RichText)
-        self._selected_label_widget.setWordWrap(True)
-        outer.addWidget(self._selected_label_widget)
-
-        # ---- Inline new-event form (hidden by default) ----
-        self._form = NewEventForm()
-        self._form.saved.connect(self._on_form_saved)
-        self._form.cancelled.connect(self._on_form_cancelled)
-        self._form.setVisible(False)
-        outer.addWidget(self._form)
+        # ---- Status banner (state-driven) ----
+        self._banner = QFrame()
+        self._banner.setFrameStyle(QFrame.Shape.StyledPanel)
+        self._banner.setMinimumHeight(72)
+        banner_layout = QVBoxLayout(self._banner)
+        banner_layout.setContentsMargins(12, 10, 12, 10)
+        self._banner_title = QLabel()
+        self._banner_title.setTextFormat(Qt.TextFormat.RichText)
+        self._banner_title.setStyleSheet("font-size: 14px;")
+        self._banner_title.setWordWrap(True)
+        self._banner_subtitle = QLabel()
+        self._banner_subtitle.setTextFormat(Qt.TextFormat.RichText)
+        self._banner_subtitle.setStyleSheet("color: #bbb; font-size: 12px;")
+        self._banner_subtitle.setWordWrap(True)
+        banner_layout.addWidget(self._banner_title)
+        banner_layout.addWidget(self._banner_subtitle)
+        outer.addWidget(self._banner)
 
         # ---- Hotkey reference ----
         ref_group = QGroupBox("Hotkeys")
@@ -251,18 +141,18 @@ class EventPanel(QWidget):
         for et in self._event_types:
             if not et.hotkey:
                 continue
-            line = f"<b>{et.hotkey.upper()}</b>  &nbsp; {et.label}"
             extras = []
-            if et.has_success:
-                extras.append("1=success / 2=fail")
             if et.has_secondary:
-                extras.append("type kit for 2nd player")
-            if extras:
-                line += (
-                    f" &nbsp; <span style='color:#888;'>({'; '.join(extras)})"
-                    f"</span>"
-                )
-            lbl = QLabel(line)
+                extras.append("→ click 2nd player")
+            if et.has_success:
+                extras.append("then 1=success / 2=fail")
+            extras_html = (
+                f" <span style='color:#888;'>({'; '.join(extras)})</span>"
+                if extras else ""
+            )
+            lbl = QLabel(
+                f"<b>{et.hotkey.upper()}</b> &nbsp; {et.label}{extras_html}"
+            )
             lbl.setTextFormat(Qt.TextFormat.RichText)
             ref_layout.addWidget(lbl)
         outer.addWidget(ref_group)
@@ -288,32 +178,76 @@ class EventPanel(QWidget):
 
         outer.addWidget(recent_group, stretch=1)
 
-        # ---- Hotkeys ----
-        # Bind every event_type's hotkey at the panel level. Context is
-        # WidgetWithChildrenShortcut so they don't fire while the operator
-        # is typing in the Players tab's kit/name inputs.
+        # ---- Hotkey wiring ----
+        # Event hotkeys: P/S/C/D/T/F/I/K/G/V/O — each starts a new event.
         for et in self._event_types:
             if not et.hotkey:
                 continue
             sc = QShortcut(QKeySequence(et.hotkey), self,
                            context=Qt.ShortcutContext.WidgetWithChildrenShortcut)
-            # Capture event_type via default-arg trick (avoid late-binding bug).
-            sc.activated.connect(lambda _et=et: self._on_hotkey(_et))
+            # Default-arg trick to avoid the late-binding closure bug.
+            sc.activated.connect(lambda _et=et: self._on_event_hotkey(_et))
+
+        # Outcome hotkeys: 1=success, 2=fail. Only meaningful in
+        # AWAITING_OUTCOME state; the handler bails out otherwise.
+        QShortcut(QKeySequence("1"), self,
+                  context=Qt.ShortcutContext.WidgetWithChildrenShortcut,
+                  activated=lambda: self._on_outcome(1))
+        QShortcut(QKeySequence("2"), self,
+                  context=Qt.ShortcutContext.WidgetWithChildrenShortcut,
+                  activated=lambda: self._on_outcome(0))
+        # Esc cancels an in-progress event.
+        QShortcut(QKeySequence("Esc"), self,
+                  context=Qt.ShortcutContext.WidgetWithChildrenShortcut,
+                  activated=self._on_cancel)
+        # Undo last event.
         QShortcut(QKeySequence("Ctrl+Z"), self,
                   context=Qt.ShortcutContext.WidgetWithChildrenShortcut,
                   activated=self._on_undo)
 
         self._refresh_recent()
+        self._update_banner()
 
-    # ------------------------------------------------------------ public
+    # ============================================================ public
     def set_selected_track(self, track_id: int, label: str) -> None:
-        """Called by the main window on every video click."""
-        self._selected_track = track_id
-        self._selected_label = label
-        self._selected_label_widget.setText(
-            f"Selected: <b>{label}</b> "
-            f"<span style='color:#888;'>(track {track_id})</span>"
-        )
+        """Called by the main window on every video click.
+
+        Behaviour depends on state:
+          * IDLE — sets primary actor for the next event.
+          * AWAITING_SECONDARY — captures the receiver / fouled player /
+            assist provider, then advances the state machine.
+          * AWAITING_OUTCOME — silently ignored. The operator probably
+            mis-clicked while we were waiting for 1/2; pressing 1/2
+            commits the event with the existing primary + secondary.
+        """
+        if self._state == _State.IDLE:
+            self._primary_track = track_id
+            self._primary_label = label
+            self._update_banner()
+            return
+
+        if self._state == _State.AWAITING_SECONDARY:
+            # Self-pass guard — clicking the same player you just hot-keyed
+            # for is almost certainly a mis-click. Refuse it and prompt.
+            if track_id == self._primary_track:
+                self._banner_subtitle.setText(
+                    "Same player can't be both actor and receiver — "
+                    "click someone else, or press Esc to cancel."
+                )
+                return
+            self._secondary_track = track_id
+            self._secondary_label = label
+            assert self._pending_event is not None
+            if self._pending_event.has_success:
+                self._state = _State.AWAITING_OUTCOME
+                self._update_banner()
+            else:
+                # has_secondary but not has_success → e.g. foul, goal.
+                # The receiver click is the commit signal.
+                self._save_event(success=None)
+            return
+
+        # AWAITING_OUTCOME — ignore stray clicks.
 
     def set_current_frame(self, frame_number: int) -> None:
         """Called by the video widget on every frame change."""
@@ -321,83 +255,54 @@ class EventPanel(QWidget):
 
     def set_tagging_team_side(self, team_side: int | None) -> None:
         """Called by the main window when the tagging-team radio flips.
-
-        Used to resolve "kit 7 secondary" → track_id on the same team.
-        """
+        Stored only for diagnostic / future-use; not needed for the
+        click-driven flow because secondary track_id is captured
+        directly from the video click."""
         self._tagging_team_side = team_side
 
-    # ---------------------------------------------------------- handlers
-    def _on_hotkey(self, event_type: EventType) -> None:
-        # Need a primary actor for any event that's about a player doing
-        # something. Throw-ins / corners are arguably set-pieces tied to
-        # a frame rather than a player, but for v1 we still require the
-        # operator to click someone (the player taking the throw-in).
-        if self._selected_track is None:
-            self._selected_label_widget.setText(
-                "<span style='color:#cc6;'>Click a player on the "
-                "video first, then press a hotkey.</span>"
+    # ============================================================ handlers
+    def _on_event_hotkey(self, event_type: EventType) -> None:
+        # No primary yet — refuse and prompt.
+        if self._primary_track is None:
+            self._banner_title.setText(
+                "<span style='color:#cc6;'>Click a player first</span>"
+            )
+            self._banner_subtitle.setText(
+                "Then press the event hotkey."
             )
             return
+        # Already mid-event — ignore (operator probably double-pressed).
+        if self._state != _State.IDLE:
+            return
+
         self._pending_event = event_type
-        self._form.configure_for(event_type, self._selected_label)
-        self._form.setVisible(True)
+        self._secondary_track = None
+        self._secondary_label = ""
 
-    def _on_form_saved(self, payload: dict) -> None:
-        if self._pending_event is None or self._selected_track is None:
-            self._form.setVisible(False)
+        if event_type.has_secondary:
+            self._state = _State.AWAITING_SECONDARY
+        elif event_type.has_success:
+            self._state = _State.AWAITING_OUTCOME
+        else:
+            # No secondary, no success → throw-in, corner, offside.
+            # Hotkey alone is the commit.
+            self._save_event(success=None)
             return
+        self._update_banner()
 
-        # Resolve frame_id for the current video frame.
-        frame_id = get_or_create_frame_id(
-            self._con, self._match.id, self._current_frame,
-        )
-        if frame_id is None:
-            # Operator scrubbed past n_frames_analysed somehow; refuse.
-            self._selected_label_widget.setText(
-                "<span style='color:#c66;'>Cannot save: this frame "
-                "wasn't ingested.</span>"
-            )
-            self._form.setVisible(False)
-            self._pending_event = None
-            return
+    def _on_outcome(self, success_value: int) -> None:
+        if self._state != _State.AWAITING_OUTCOME:
+            return  # 1/2 pressed outside an outcome wait — ignore
+        self._save_event(success=success_value)
 
-        # Resolve secondary kit → track_id on the same tagging team.
-        secondary_track_id: int | None = None
-        notes: str | None = None
-        secondary_kit = payload.get("secondary_kit")
-        if secondary_kit is not None and self._tagging_team_side is not None:
-            secondary_track_id = find_track_for_kit(
-                self._con,
-                match_id=self._match.id,
-                team_side=self._tagging_team_side,
-                kit_number=secondary_kit,
-            )
-            if secondary_track_id is None:
-                # Kit not yet mapped — preserve the intent in notes so
-                # the operator can hand-fix later.
-                notes = f"secondary kit {secondary_kit} (not yet mapped)"
-
-        timestamp_ms = int(round(self._current_frame * 1000.0 / self._match.fps))
-        insert_event(
-            self._con,
-            match_id=self._match.id,
-            frame_id=frame_id,
-            timestamp_ms=timestamp_ms,
-            event_type=self._pending_event.code,
-            primary_track_id=self._selected_track,
-            secondary_track_id=secondary_track_id,
-            success=payload.get("success"),
-            notes=notes,
-        )
-
-        self._form.setVisible(False)
+    def _on_cancel(self) -> None:
+        if self._state == _State.IDLE:
+            return  # nothing to cancel
         self._pending_event = None
-        self._refresh_recent()
-        self.event_logged.emit()
-
-    def _on_form_cancelled(self) -> None:
-        self._form.setVisible(False)
-        self._pending_event = None
+        self._secondary_track = None
+        self._secondary_label = ""
+        self._state = _State.IDLE
+        self._update_banner()
 
     def _on_undo(self) -> None:
         rows = list_recent_events(self._con, self._match.id, limit=1)
@@ -411,7 +316,129 @@ class EventPanel(QWidget):
         frame = int(item.data(Qt.ItemDataRole.UserRole))
         self.event_clicked.emit(frame)
 
-    # ---------------------------------------------------------- internals
+    # ============================================================ internals
+    def _save_event(self, *, success: int | None) -> None:
+        if self._pending_event is None or self._primary_track is None:
+            self._on_cancel()
+            return
+
+        frame_id = get_or_create_frame_id(
+            self._con, self._match.id, self._current_frame,
+        )
+        if frame_id is None:
+            # Operator scrubbed past n_frames_analysed — refuse and tell them.
+            self._banner_title.setText(
+                "<span style='color:#c66;'>Cannot save</span>"
+            )
+            self._banner_subtitle.setText(
+                "This frame wasn't ingested. Move to a frame within the clip."
+            )
+            self._on_cancel()
+            return
+
+        timestamp_ms = int(round(self._current_frame * 1000.0 / self._match.fps))
+        insert_event(
+            self._con,
+            match_id=self._match.id,
+            frame_id=frame_id,
+            timestamp_ms=timestamp_ms,
+            event_type=self._pending_event.code,
+            primary_track_id=self._primary_track,
+            secondary_track_id=self._secondary_track,
+            success=success,
+            notes=None,
+        )
+
+        self._pending_event = None
+        self._secondary_track = None
+        self._secondary_label = ""
+        self._state = _State.IDLE
+        self._refresh_recent()
+        self.event_logged.emit()
+        self._update_banner()
+        # Primary stays selected — operator usually tags multiple events
+        # for the same player in a row.
+
+    def _update_banner(self) -> None:
+        bg = _BANNER_COLORS[self._state]
+        # Reuse the QFrame's stylesheet so we get a nice solid colour
+        # regardless of theme.
+        self._banner.setStyleSheet(
+            f"QFrame {{ background-color: {bg}; "
+            f"  border: 1px solid #555; border-radius: 4px; }}"
+        )
+
+        if self._state == _State.IDLE:
+            if self._primary_track is None:
+                self._banner_title.setText(
+                    "<i>Click a player on the video to start.</i>"
+                )
+                self._banner_subtitle.setText("")
+            else:
+                self._banner_title.setText(
+                    f"Selected: <b>{self._primary_label}</b> "
+                    f"<span style='color:#888;'>(track "
+                    f"{self._primary_track})</span>"
+                )
+                self._banner_subtitle.setText(
+                    "Press an event hotkey (P/S/C/D/T/F/I/K/G/V/O), "
+                    "or click a different player."
+                )
+            return
+
+        assert self._pending_event is not None
+        if self._state == _State.AWAITING_SECONDARY:
+            self._banner_title.setText(
+                f"<b>{self._pending_event.label}</b> by "
+                f"<b>{self._primary_label}</b>"
+            )
+            secondary_role = self._secondary_role_label(self._pending_event)
+            self._banner_subtitle.setText(
+                f"Click the <b>{secondary_role}</b> on the video "
+                f"&nbsp;·&nbsp; <span style='color:#aaa;'>Esc to cancel</span>"
+            )
+            return
+
+        # AWAITING_OUTCOME
+        head = (
+            f"<b>{self._pending_event.label}</b>: "
+            f"<b>{self._primary_label}</b>"
+        )
+        if self._secondary_track is not None:
+            head += f" → <b>{self._secondary_label}</b>"
+        self._banner_title.setText(head)
+        s_options = self._success_option_labels(self._pending_event)
+        self._banner_subtitle.setText(
+            f"Press <b>1</b> = {s_options[0]} &nbsp;·&nbsp; "
+            f"<b>2</b> = {s_options[1]} &nbsp;·&nbsp; "
+            f"<span style='color:#aaa;'>Esc to cancel</span>"
+        )
+
+    @staticmethod
+    def _secondary_role_label(et: EventType) -> str:
+        # Surface a more specific noun than "secondary player" so the
+        # operator knows what they're being asked for.
+        return {
+            "pass":   "receiver",
+            "cross":  "receiver",
+            "tackle": "opponent",
+            "foul":   "fouled player",
+            "goal":   "assist provider",
+        }.get(et.code, "second player")
+
+    @staticmethod
+    def _success_option_labels(et: EventType) -> tuple[str, str]:
+        # Custom labels for the two outcome options so 1/2 are
+        # event-aware.
+        return {
+            "pass":    ("completed",  "incomplete"),
+            "shot":    ("on target",  "off target"),
+            "cross":   ("connected",  "missed"),
+            "dribble": ("succeeded",  "lost ball"),
+            "tackle":  ("won ball",   "missed"),
+            "save":    ("saved",      "let in"),
+        }.get(et.code, ("success", "fail"))
+
     def _refresh_recent(self) -> None:
         rows = list_recent_events(self._con, self._match.id, limit=30)
         self._recent_list.clear()
