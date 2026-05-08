@@ -163,21 +163,37 @@ def get_frame_state(
 
 def hit_test(
     players: list[FramePlayerPos], cx: float, cy: float,
+    *,
+    margin_px: float = 24.0,
 ) -> FramePlayerPos | None:
-    """Find which player bbox contains the click point.
+    """Find which player bbox the click is on (or near).
 
-    If the click hits multiple overlapping bboxes (e.g. crowded set
-    piece), pick the one with the SMALLEST area — typically the player
-    nearest the camera, which matches what the operator probably aimed
-    at. Returns None if no bbox contains the click.
+    The forgiving margin matters because YOLO bboxes for far-camera
+    players can be ~20×40 px — landing a click precisely inside that
+    while the player is also moving fast is genuinely hard. We expand
+    each bbox by ``margin_px`` on every side, take any matches, and
+    pick the one whose CENTRE is closest to the click. That way a
+    near-miss on a small bbox still snaps to the intended player rather
+    than failing silently.
+
+    If two enlarged bboxes both cover the click, closest-centre still
+    picks the right one in the common case (two close players ⇒
+    pick the one your cursor was actually over).
     """
     candidates = [
         p for p in players
-        if p.bbox_x1 <= cx <= p.bbox_x2 and p.bbox_y1 <= cy <= p.bbox_y2
+        if (p.bbox_x1 - margin_px) <= cx <= (p.bbox_x2 + margin_px)
+        and (p.bbox_y1 - margin_px) <= cy <= (p.bbox_y2 + margin_px)
     ]
     if not candidates:
         return None
-    return min(candidates, key=lambda p: (p.bbox_x2 - p.bbox_x1) * (p.bbox_y2 - p.bbox_y1))
+    return min(
+        candidates,
+        key=lambda p: (
+            ((p.bbox_x1 + p.bbox_x2) / 2.0 - cx) ** 2
+            + ((p.bbox_y1 + p.bbox_y2) / 2.0 - cy) ** 2
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

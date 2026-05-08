@@ -118,18 +118,30 @@ class EventPanel(QWidget):
         outer.setSpacing(10)
 
         # ---- Status banner (state-driven) ----
+        # ObjectName-scoped stylesheet — without it, the parent widget's
+        # generic ``QWidget { background-color: #1f1f1f; }`` rule wins
+        # because it's higher in the cascade and the banner shows up
+        # invisible on the dark panel background.
         self._banner = QFrame()
+        self._banner.setObjectName("event_banner")
         self._banner.setFrameStyle(QFrame.Shape.StyledPanel)
         self._banner.setMinimumHeight(72)
+        # autoFillBackground is also needed on QFrame for the
+        # background-color rule to actually paint solidly.
+        self._banner.setAutoFillBackground(True)
         banner_layout = QVBoxLayout(self._banner)
         banner_layout.setContentsMargins(12, 10, 12, 10)
         self._banner_title = QLabel()
         self._banner_title.setTextFormat(Qt.TextFormat.RichText)
-        self._banner_title.setStyleSheet("font-size: 14px;")
+        self._banner_title.setStyleSheet(
+            "font-size: 14px; background: transparent;"
+        )
         self._banner_title.setWordWrap(True)
         self._banner_subtitle = QLabel()
         self._banner_subtitle.setTextFormat(Qt.TextFormat.RichText)
-        self._banner_subtitle.setStyleSheet("color: #bbb; font-size: 12px;")
+        self._banner_subtitle.setStyleSheet(
+            "color: #ddd; font-size: 12px; background: transparent;"
+        )
         self._banner_subtitle.setWordWrap(True)
         banner_layout.addWidget(self._banner_title)
         banner_layout.addWidget(self._banner_subtitle)
@@ -179,30 +191,34 @@ class EventPanel(QWidget):
         outer.addWidget(recent_group, stretch=1)
 
         # ---- Hotkey wiring ----
-        # Event hotkeys: P/S/C/D/T/F/I/K/G/V/O — each starts a new event.
+        # WindowShortcut so hotkeys fire regardless of which widget in
+        # the window has focus — critical because after a video click,
+        # focus lands on the VideoSurface (outside this panel), so
+        # WidgetWithChildrenShortcut would never trigger.
+        # Tab-visibility check inside each handler keeps the events-tab
+        # hotkeys dormant when the operator's on the Players tab.
         for et in self._event_types:
             if not et.hotkey:
                 continue
             sc = QShortcut(QKeySequence(et.hotkey), self,
-                           context=Qt.ShortcutContext.WidgetWithChildrenShortcut)
-            # Default-arg trick to avoid the late-binding closure bug.
+                           context=Qt.ShortcutContext.WindowShortcut)
             sc.activated.connect(lambda _et=et: self._on_event_hotkey(_et))
 
-        # Outcome hotkeys: 1=success, 2=fail. Only meaningful in
-        # AWAITING_OUTCOME state; the handler bails out otherwise.
         QShortcut(QKeySequence("1"), self,
-                  context=Qt.ShortcutContext.WidgetWithChildrenShortcut,
+                  context=Qt.ShortcutContext.WindowShortcut,
                   activated=lambda: self._on_outcome(1))
         QShortcut(QKeySequence("2"), self,
-                  context=Qt.ShortcutContext.WidgetWithChildrenShortcut,
+                  context=Qt.ShortcutContext.WindowShortcut,
                   activated=lambda: self._on_outcome(0))
-        # Esc cancels an in-progress event.
-        QShortcut(QKeySequence("Esc"), self,
-                  context=Qt.ShortcutContext.WidgetWithChildrenShortcut,
-                  activated=self._on_cancel)
-        # Undo last event.
+        # Esc only enabled while a flow is in progress — otherwise the
+        # toolbar's "back to matches" Esc takes over.
+        self._cancel_shortcut = QShortcut(QKeySequence("Esc"), self,
+                                            context=Qt.ShortcutContext.WindowShortcut)
+        self._cancel_shortcut.activated.connect(self._on_cancel)
+        self._cancel_shortcut.setEnabled(False)
+
         QShortcut(QKeySequence("Ctrl+Z"), self,
-                  context=Qt.ShortcutContext.WidgetWithChildrenShortcut,
+                  context=Qt.ShortcutContext.WindowShortcut,
                   activated=self._on_undo)
 
         self._refresh_recent()
@@ -262,6 +278,11 @@ class EventPanel(QWidget):
 
     # ============================================================ handlers
     def _on_event_hotkey(self, event_type: EventType) -> None:
+        # Tab-visibility gate: hotkeys are bound at window-shortcut scope
+        # so they fire even when the video has focus, but we don't want
+        # them firing while the Players tab is on top.
+        if not self.isVisible():
+            return
         # No primary yet — refuse and prompt.
         if self._primary_track is None:
             self._banner_title.setText(
@@ -291,11 +312,15 @@ class EventPanel(QWidget):
         self._update_banner()
 
     def _on_outcome(self, success_value: int) -> None:
+        if not self.isVisible():
+            return
         if self._state != _State.AWAITING_OUTCOME:
             return  # 1/2 pressed outside an outcome wait — ignore
         self._save_event(success=success_value)
 
     def _on_cancel(self) -> None:
+        if not self.isVisible():
+            return
         if self._state == _State.IDLE:
             return  # nothing to cancel
         self._pending_event = None
@@ -305,6 +330,8 @@ class EventPanel(QWidget):
         self._update_banner()
 
     def _on_undo(self) -> None:
+        if not self.isVisible():
+            return
         rows = list_recent_events(self._con, self._match.id, limit=1)
         if not rows:
             return
@@ -361,12 +388,15 @@ class EventPanel(QWidget):
 
     def _update_banner(self) -> None:
         bg = _BANNER_COLORS[self._state]
-        # Reuse the QFrame's stylesheet so we get a nice solid colour
-        # regardless of theme.
+        # ObjectName-scoped selector — generic ``QFrame`` would lose to
+        # the parent QWidget's stylesheet cascade.
         self._banner.setStyleSheet(
-            f"QFrame {{ background-color: {bg}; "
+            f"QFrame#event_banner {{ background-color: {bg}; "
             f"  border: 1px solid #555; border-radius: 4px; }}"
         )
+        # Esc cancels only when there's something to cancel; otherwise
+        # let the main window's toolbar Esc handle "back to matches".
+        self._cancel_shortcut.setEnabled(self._state != _State.IDLE)
 
         if self._state == _State.IDLE:
             if self._primary_track is None:
