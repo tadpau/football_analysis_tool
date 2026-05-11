@@ -889,6 +889,134 @@ def compute_player_stats(
     ]
 
 
+def get_team_world_positions(
+    con: sqlite3.Connection, match_id: int, team_side: int,
+) -> list[tuple[float, float]]:
+    """Every (x, y) world coord stamped on ``frame_player_positions``
+    for the given CV-detected ``team_side``. Used by the reports view
+    to build a 2D occupancy histogram for the team heatmap.
+
+    Skips rows without world coords (frames before homography
+    converged, refs that drifted off the calibrated quad, etc.).
+    """
+    rows = con.execute(
+        """
+        SELECT fpp.foot_x_world, fpp.foot_y_world
+        FROM frame_player_positions fpp
+        JOIN frames f ON f.id = fpp.frame_id
+        WHERE f.match_id = ?
+          AND fpp.team = ?
+          AND fpp.foot_x_world IS NOT NULL
+          AND fpp.foot_y_world IS NOT NULL
+        """,
+        (match_id, team_side),
+    ).fetchall()
+    return [(float(r["foot_x_world"]), float(r["foot_y_world"])) for r in rows]
+
+
+def derive_team_side(
+    con: sqlite3.Connection, match_id: int, team_id: int,
+) -> int | None:
+    """Resolve which CV-detected ``team_side`` (1 or 2) most of this
+    team's tracks were classified as.
+
+    The team-side ↔ home/away binding is implicit in
+    ``match_track_to_player``: the operator's track-to-roster mapping
+    carries the CV-detected ``team_side`` for each track, so the
+    dominant ``team_side`` across all of a roster team's mapped tracks
+    is the CV cluster that matches their kit colour. Returns None if
+    no tracks have been mapped yet — the caller falls back to a
+    sensible default (1 for home, 2 for away).
+    """
+    row = con.execute(
+        """
+        SELECT mtp.team_side, COUNT(*) AS n
+        FROM match_track_to_player mtp
+        JOIN players p ON p.id = mtp.player_id
+        WHERE mtp.match_id = ?
+          AND p.team_id = ?
+          AND mtp.team_side IS NOT NULL
+        GROUP BY mtp.team_side
+        ORDER BY n DESC
+        LIMIT 1
+        """,
+        (match_id, team_id),
+    ).fetchone()
+    return int(row["team_side"]) if row else None
+
+
+@dataclass(frozen=True)
+class EventLocation:
+    """One event with its world-space coordinate at the moment of capture.
+
+    Computed by JOINing events with frame_player_positions on
+    ``(frame_id, primary_track_id)`` — i.e. the world position of the
+    actor at the frame the operator clicked the event hotkey.
+    """
+    event_type: str
+    event_label: str
+    x_world: float
+    y_world: float
+    success: int | None
+    primary_track_id: int
+    primary_player_name: str | None
+
+
+def get_event_locations(
+    con: sqlite3.Connection, match_id: int,
+    team_side: int | None = None,
+) -> list[EventLocation]:
+    """All events plotted on the pitch. Optionally filter by team_side
+    so the reports view can colour-code home vs away events separately.
+
+    Events whose primary actor has no world position at that frame
+    (homography wasn't applied to that frame, actor was off the
+    calibrated quad) are skipped — they can't be plotted.
+    """
+    sql = """
+        SELECT
+            e.event_type,
+            et.label AS event_label,
+            e.success,
+            e.primary_track_id,
+            fpp.foot_x_world,
+            fpp.foot_y_world,
+            fpp.team,
+            COALESCE(p.first_name || ' ' || p.last_name,
+                     p.first_name, p.last_name) AS primary_name
+        FROM events e
+        JOIN event_types et ON et.code = e.event_type
+        JOIN frame_player_positions fpp
+            ON fpp.frame_id = e.frame_id
+           AND fpp.track_id = e.primary_track_id
+        LEFT JOIN match_track_to_player mtp
+            ON mtp.match_id = e.match_id AND mtp.track_id = e.primary_track_id
+        LEFT JOIN players p ON p.id = mtp.player_id
+        WHERE e.match_id = ?
+          AND e.deleted_at IS NULL
+          AND fpp.foot_x_world IS NOT NULL
+    """
+    params: list = [match_id]
+    if team_side is not None:
+        sql += " AND fpp.team = ?"
+        params.append(team_side)
+    sql += " ORDER BY e.timestamp_ms"
+    rows = con.execute(sql, params).fetchall()
+    return [
+        EventLocation(
+            event_type=r["event_type"],
+            event_label=r["event_label"],
+            x_world=float(r["foot_x_world"]),
+            y_world=float(r["foot_y_world"]),
+            success=r["success"],
+            primary_track_id=int(r["primary_track_id"]),
+            primary_player_name=(r["primary_name"].strip()
+                                  if r["primary_name"] else None),
+        )
+        for r in rows
+    ]
+
+
 def soft_delete_event(con: sqlite3.Connection, event_id: int) -> None:
     """Mark an event as deleted (sets ``deleted_at = CURRENT_TIMESTAMP``).
 

@@ -39,6 +39,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .heatmap_canvas import HeatmapCanvas
 from .repository import (
     MatchStats,
     MatchSummary,
@@ -46,7 +47,10 @@ from .repository import (
     TeamInfo,
     compute_match_stats,
     compute_player_stats,
+    derive_team_side,
+    get_event_locations,
     get_match_teams,
+    get_team_world_positions,
 )
 
 
@@ -206,6 +210,25 @@ class ReportsWidget(QWidget):
         table_layout.addWidget(self._table)
         outer.addWidget(table_group, stretch=1)
 
+        # ---- Heatmap + event scatter ----
+        heatmap_group = QGroupBox("Heatmap & events")
+        heatmap_layout = QVBoxLayout(heatmap_group)
+        self._heatmap = HeatmapCanvas(self)
+        self._heatmap.setMinimumHeight(360)
+        heatmap_layout.addWidget(self._heatmap)
+        # Legend strip — small dots + colour name so the operator can
+        # read the scatter overlay without inspection. Outline-only
+        # markers in the chart itself denote failed events.
+        legend_label = QLabel(
+            "<span style='color:#888;'>"
+            "Successful events filled · failed events outlined · "
+            "marker colour = event type"
+            "</span>"
+        )
+        legend_label.setTextFormat(Qt.TextFormat.RichText)
+        heatmap_layout.addWidget(legend_label)
+        outer.addWidget(heatmap_group, stretch=2)
+
         self.refresh()
 
     # ============================================================ public
@@ -213,6 +236,7 @@ class ReportsWidget(QWidget):
         """Re-query stats from the DB and re-render every widget."""
         self._refresh_summary()
         self._refresh_player_table()
+        self._refresh_heatmap()
 
     # ============================================================ helpers
     @staticmethod
@@ -299,3 +323,20 @@ class ReportsWidget(QWidget):
             self._home if self._home_radio.isChecked() else self._away
         )
         self._refresh_player_table()
+        self._refresh_heatmap()
+
+    def _refresh_heatmap(self) -> None:
+        team = self._team_for_player_table
+        # CV team_side is derived from the operator's track→player
+        # mappings — that's the only place we know which kit colour
+        # corresponds to which roster team. Fall back to home=1, away=2
+        # if no tracks have been mapped yet.
+        side = derive_team_side(self._con, self._match.id, team.id)
+        if side is None:
+            side = 1 if team.is_home else 2
+        positions = get_team_world_positions(self._con, self._match.id, side)
+        events = get_event_locations(self._con, self._match.id, team_side=side)
+        self._heatmap.render(
+            positions, events,
+            title=f"{team.name} — occupancy + events ({len(events)} on pitch)",
+        )
