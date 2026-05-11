@@ -16,6 +16,7 @@ from __future__ import annotations
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 
 from .repository import EventLocation
 
@@ -196,6 +197,52 @@ class HeatmapCanvas(FigureCanvasQTAgg):
                         marker="o",
                         zorder=5,
                     )
+
+        # Build a legend that only includes event types actually present
+        # on the current scatter — listing every type when the operator's
+        # only tagged passes would just be noise.
+        if events:
+            present_types = []
+            for et_code in _EVENT_COLORS:  # preserves the seeded ordering
+                if any(e.event_type == et_code for e in events):
+                    present_types.append(et_code)
+            if present_types:
+                handles = [
+                    Line2D(
+                        [0], [0],
+                        marker="o", color="none",
+                        markerfacecolor=_EVENT_COLORS[code],
+                        markeredgecolor=_EVENT_COLORS[code],
+                        markersize=8,
+                        label=code.replace("_", " ").capitalize(),
+                        linestyle="",
+                    )
+                    for code in present_types
+                ]
+                # Tail entries explain the filled-vs-outlined convention
+                # so the operator can read the success/fail distinction.
+                handles.append(Line2D(
+                    [0], [0], marker="o", color="none",
+                    markerfacecolor="white", markeredgecolor="white",
+                    markersize=8, label="✓ successful", linestyle="",
+                ))
+                handles.append(Line2D(
+                    [0], [0], marker="o", color="none",
+                    markerfacecolor="none", markeredgecolor="white",
+                    markersize=8, label="✗ failed", linestyle="",
+                ))
+                leg = self._ax.legend(
+                    handles=handles,
+                    loc="upper right",
+                    facecolor="#1a3a23",
+                    edgecolor="#555",
+                    labelcolor="white",
+                    fontsize=9,
+                    framealpha=0.85,
+                )
+                # The legend's frame inherits a black border by default
+                # which clashes with the dark-green background.
+                leg.get_frame().set_linewidth(0.8)
 
         if title:
             self._ax.set_title(title, color="white", fontsize=11)

@@ -889,6 +889,91 @@ def compute_player_stats(
     ]
 
 
+def get_player_track_ids(
+    con: sqlite3.Connection, match_id: int, player_id: int,
+) -> list[int]:
+    """Every track_id the operator has mapped to this player in this
+    match. A single player can have many track_ids — one per ByteTrack
+    ID-flip on re-appearance — so per-player views must union all of
+    them."""
+    rows = con.execute(
+        "SELECT track_id FROM match_track_to_player "
+        "WHERE match_id = ? AND player_id = ?",
+        (match_id, player_id),
+    ).fetchall()
+    return [int(r["track_id"]) for r in rows]
+
+
+def get_player_world_positions(
+    con: sqlite3.Connection, match_id: int, player_id: int,
+) -> list[tuple[float, float]]:
+    """All (x, y) world coords for every track mapped to this player
+    in this match. Powers the player drill-down heatmap."""
+    rows = con.execute(
+        """
+        SELECT fpp.foot_x_world, fpp.foot_y_world
+        FROM frame_player_positions fpp
+        JOIN frames f ON f.id = fpp.frame_id
+        JOIN match_track_to_player mtp
+          ON mtp.match_id = f.match_id AND mtp.track_id = fpp.track_id
+        WHERE f.match_id = ? AND mtp.player_id = ?
+          AND fpp.foot_x_world IS NOT NULL
+          AND fpp.foot_y_world IS NOT NULL
+        """,
+        (match_id, player_id),
+    ).fetchall()
+    return [(float(r["foot_x_world"]), float(r["foot_y_world"])) for r in rows]
+
+
+def get_player_event_locations(
+    con: sqlite3.Connection, match_id: int, player_id: int,
+) -> list[EventLocation]:
+    """Events where the player is the *primary* actor. Their reception
+    events (as secondary) are intentionally excluded — drill-down is
+    about "what they did", not "what happened to them"."""
+    rows = con.execute(
+        """
+        SELECT
+            e.event_type,
+            et.label AS event_label,
+            e.success,
+            e.primary_track_id,
+            fpp.foot_x_world,
+            fpp.foot_y_world,
+            COALESCE(p.first_name || ' ' || p.last_name,
+                     p.first_name, p.last_name) AS primary_name
+        FROM events e
+        JOIN event_types et ON et.code = e.event_type
+        JOIN match_track_to_player mtp_primary
+            ON mtp_primary.match_id = e.match_id
+           AND mtp_primary.track_id = e.primary_track_id
+        JOIN frame_player_positions fpp
+            ON fpp.frame_id = e.frame_id
+           AND fpp.track_id = e.primary_track_id
+        LEFT JOIN players p ON p.id = mtp_primary.player_id
+        WHERE e.match_id = ?
+          AND mtp_primary.player_id = ?
+          AND e.deleted_at IS NULL
+          AND fpp.foot_x_world IS NOT NULL
+        ORDER BY e.timestamp_ms
+        """,
+        (match_id, player_id),
+    ).fetchall()
+    return [
+        EventLocation(
+            event_type=r["event_type"],
+            event_label=r["event_label"],
+            x_world=float(r["foot_x_world"]),
+            y_world=float(r["foot_y_world"]),
+            success=r["success"],
+            primary_track_id=int(r["primary_track_id"]),
+            primary_player_name=(r["primary_name"].strip()
+                                  if r["primary_name"] else None),
+        )
+        for r in rows
+    ]
+
+
 def get_team_world_positions(
     con: sqlite3.Connection, match_id: int, team_side: int,
 ) -> list[tuple[float, float]]:

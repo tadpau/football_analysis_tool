@@ -50,6 +50,8 @@ from .repository import (
     derive_team_side,
     get_event_locations,
     get_match_teams,
+    get_player_event_locations,
+    get_player_world_positions,
     get_team_world_positions,
 )
 
@@ -128,6 +130,10 @@ class ReportsWidget(QWidget):
         self._match = match
         self._home, self._away = get_match_teams(connection, match.id)
         self._team_for_player_table: TeamInfo = self._home
+        # Drill-down state: when set, the heatmap shows only this
+        # player's positions + events. None = full team view.
+        self._filtered_player_id: int | None = None
+        self._filtered_player_label: str = ""
 
         self.setStyleSheet(
             "QWidget { background-color: #1f1f1f; color: #ddd; } "
@@ -203,30 +209,46 @@ class ReportsWidget(QWidget):
         self._table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
         )
+        self._table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        # Clicking any cell selects the row; emits a signal we use to
+        # drill the heatmap into that player.
+        self._table.itemSelectionChanged.connect(self._on_table_row_selected)
         h = self._table.horizontalHeader()
         h.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         # Player-name column stretches to fill remaining horizontal space.
         h.setSectionResizeMode(self._NAME_COLUMN, QHeaderView.ResizeMode.Stretch)
         table_layout.addWidget(self._table)
+        table_layout.addWidget(QLabel(
+            "<span style='color:#888;'>Click a row to drill the heatmap "
+            "into that player.</span>"
+        ))
         outer.addWidget(table_group, stretch=1)
 
         # ---- Heatmap + event scatter ----
         heatmap_group = QGroupBox("Heatmap & events")
         heatmap_layout = QVBoxLayout(heatmap_group)
+
+        # Top strip — current filter description + "Show team" button.
+        # When a player is drilled into, the button becomes enabled and
+        # clears the filter back to the team view.
+        filter_row = QHBoxLayout()
+        self._heatmap_filter_label = QLabel("")
+        self._heatmap_filter_label.setTextFormat(Qt.TextFormat.RichText)
+        filter_row.addWidget(self._heatmap_filter_label, stretch=1)
+        self._show_team_btn = QPushButton("Show team")
+        self._show_team_btn.setToolTip(
+            "Clear the player filter and show the full team heatmap"
+        )
+        self._show_team_btn.clicked.connect(self._on_clear_player_filter)
+        self._show_team_btn.setEnabled(False)
+        filter_row.addWidget(self._show_team_btn)
+        heatmap_layout.addLayout(filter_row)
+
         self._heatmap = HeatmapCanvas(self)
         self._heatmap.setMinimumHeight(360)
         heatmap_layout.addWidget(self._heatmap)
-        # Legend strip — small dots + colour name so the operator can
-        # read the scatter overlay without inspection. Outline-only
-        # markers in the chart itself denote failed events.
-        legend_label = QLabel(
-            "<span style='color:#888;'>"
-            "Successful events filled · failed events outlined · "
-            "marker colour = event type"
-            "</span>"
-        )
-        legend_label.setTextFormat(Qt.TextFormat.RichText)
-        heatmap_layout.addWidget(legend_label)
         outer.addWidget(heatmap_group, stretch=2)
 
         self.refresh()
@@ -322,11 +344,66 @@ class ReportsWidget(QWidget):
         self._team_for_player_table = (
             self._home if self._home_radio.isChecked() else self._away
         )
+        # Switching the team radio is an implicit "I want the team view"
+        # gesture — clear any drill-down filter that might be active.
+        self._filtered_player_id = None
+        self._filtered_player_label = ""
         self._refresh_player_table()
+        self._refresh_heatmap()
+
+    def _on_table_row_selected(self) -> None:
+        rows = self._table.selectionModel().selectedRows()
+        if not rows:
+            return
+        first_cell = self._table.item(rows[0].row(), 0)
+        if first_cell is None:
+            return
+        player_id = first_cell.data(Qt.ItemDataRole.UserRole)
+        if player_id is None:
+            return
+        # Cache the player's display name from the table itself — keeps
+        # the heatmap title in sync with the table's truncation rules.
+        kit_cell = self._table.item(rows[0].row(), 0)
+        name_cell = self._table.item(rows[0].row(), self._NAME_COLUMN)
+        kit = kit_cell.text() if kit_cell else "—"
+        name = name_cell.text() if name_cell else "(unnamed)"
+        self._filtered_player_id = int(player_id)
+        self._filtered_player_label = f"#{kit} {name}".replace("#—", "")
+        self._refresh_heatmap()
+
+    def _on_clear_player_filter(self) -> None:
+        self._filtered_player_id = None
+        self._filtered_player_label = ""
+        self._table.clearSelection()
         self._refresh_heatmap()
 
     def _refresh_heatmap(self) -> None:
         team = self._team_for_player_table
+
+        # --- Drill-down view: a specific player ---
+        if self._filtered_player_id is not None:
+            positions = get_player_world_positions(
+                self._con, self._match.id, self._filtered_player_id,
+            )
+            events = get_player_event_locations(
+                self._con, self._match.id, self._filtered_player_id,
+            )
+            self._heatmap_filter_label.setText(
+                f"Showing: <b>{self._filtered_player_label}</b> "
+                f"<span style='color:#888;'>· "
+                f"{len(positions):,} positions · {len(events)} events</span>"
+            )
+            self._show_team_btn.setEnabled(True)
+            self._heatmap.render(
+                positions, events,
+                title=(
+                    f"{self._filtered_player_label} — positions + events "
+                    f"({len(events)} on pitch)"
+                ),
+            )
+            return
+
+        # --- Team view (default) ---
         # CV team_side is derived from the operator's track→player
         # mappings — that's the only place we know which kit colour
         # corresponds to which roster team. Fall back to home=1, away=2
@@ -336,6 +413,11 @@ class ReportsWidget(QWidget):
             side = 1 if team.is_home else 2
         positions = get_team_world_positions(self._con, self._match.id, side)
         events = get_event_locations(self._con, self._match.id, team_side=side)
+        self._heatmap_filter_label.setText(
+            f"Showing: <b>{team.name}</b> "
+            f"<span style='color:#888;'>(full team)</span>"
+        )
+        self._show_team_btn.setEnabled(False)
         self._heatmap.render(
             positions, events,
             title=f"{team.name} — occupancy + events ({len(events)} on pitch)",
