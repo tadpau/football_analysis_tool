@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
 
 from ..db.connection import open_db
 from .event_panel import EventPanel
+from .reports_widget import ReportsWidget
 from .repository import MatchSummary, get_match, list_matches
 from .track_mapping_panel import TrackMappingPanel
 from .video_widget import VideoWidget
@@ -278,6 +279,11 @@ class MainWindow(QMainWindow):
         self._con = open_db(db_path)
         self._db_path = db_path
 
+        # Currently-open match + its lazy reports widget. Both stay
+        # None until ``_open_match`` runs and get reset on ``_show_selector``.
+        self._current_match: MatchSummary | None = None
+        self._current_reports: ReportsWidget | None = None
+
         # ---- Toolbar ----
         toolbar = QToolBar("Main")
         toolbar.setMovable(False)
@@ -291,6 +297,17 @@ class MainWindow(QMainWindow):
         self._back_action.triggered.connect(self._show_selector)
         self._back_action.setEnabled(False)  # nothing to go back to initially
         toolbar.addAction(self._back_action)
+
+        # Two view-switch actions: toggle between Tagger and Reports for
+        # the currently-open match. Only enabled once a match is open.
+        self._tagger_action = QAction("🎯 Tagger", self)
+        self._tagger_action.triggered.connect(self._show_tagger_view)
+        self._tagger_action.setEnabled(False)
+        toolbar.addAction(self._tagger_action)
+        self._reports_action = QAction("📊 Reports", self)
+        self._reports_action.triggered.connect(self._show_reports_view)
+        self._reports_action.setEnabled(False)
+        toolbar.addAction(self._reports_action)
 
         # ---- View stack ----
         self._stack = QStackedWidget()
@@ -329,24 +346,57 @@ class MainWindow(QMainWindow):
                 f"No match with id={match_id} in this DB.",
             )
             return
-        tagger = TaggerWidget(self._con, match)
-        # Tagger goes at index 1; replace any previous one.
+
+        # Tear down any previously-open match widgets to free memory
+        # (each VideoWidget owns a cv2.VideoCapture). Selector stays at
+        # stack index 0; we always rebuild Tagger at 1 and Reports at 2.
         while self._stack.count() > 1:
             old = self._stack.widget(1)
             self._stack.removeWidget(old)
             old.deleteLater()
-        self._stack.addWidget(tagger)
+
+        self._current_tagger = TaggerWidget(self._con, match)
+        self._stack.addWidget(self._current_tagger)
+        # Reports is built lazily on first switch — saves a second of
+        # query work and an avoidable repaint for operators who just
+        # want to tag.
+        self._current_reports: ReportsWidget | None = None
+        self._current_match: MatchSummary = match
+
         self._stack.setCurrentIndex(1)
         self._back_action.setEnabled(True)
+        self._tagger_action.setEnabled(True)
+        self._reports_action.setEnabled(True)
         self.statusBar().showMessage(
             f"DB: {self._db_path}    Match {match.id}: "
             f"{match.home_team} vs {match.away_team}    "
             f"{match.n_frames:,} frames @ {match.fps:.0f} fps"
         )
 
+    def _show_tagger_view(self) -> None:
+        if self._stack.count() > 1:
+            self._stack.setCurrentIndex(1)
+
+    def _show_reports_view(self) -> None:
+        # Lazy-build the reports widget the first time it's requested.
+        # When the operator switches back to it later, refresh the
+        # queries so any newly-tagged events show up.
+        if self._current_match is None:
+            return
+        if self._current_reports is None:
+            self._current_reports = ReportsWidget(self._con, self._current_match)
+            self._stack.addWidget(self._current_reports)
+        else:
+            self._current_reports.refresh()
+        self._stack.setCurrentIndex(self._stack.indexOf(self._current_reports))
+
     def _show_selector(self) -> None:
         self._stack.setCurrentIndex(0)
         self._back_action.setEnabled(False)
+        self._tagger_action.setEnabled(False)
+        self._reports_action.setEnabled(False)
+        self._current_match = None
+        self._current_reports = None
         self.statusBar().showMessage(f"DB: {self._db_path}")
 
     # ---------------------------------------------------------- close

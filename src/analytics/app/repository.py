@@ -642,6 +642,253 @@ def list_recent_events(
     ]
 
 
+# ---------------------------------------------------------------------------
+# Reports / dashboard (Phase 3 — aggregates over events + CV state)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class MatchStats:
+    """Headline numbers for the match summary panel.
+
+    Pulled by aggregating ``events`` (operator-tagged) and joining with
+    ``frame_player_positions`` (CV-derived). Pure counts — accuracy
+    percentages are derived in the UI for display.
+    """
+    total_events: int
+    passes_attempted: int
+    passes_completed: int
+    shots: int
+    shots_on_target: int
+    goals: int
+    tackles_attempted: int
+    tackles_won: int
+    fouls_committed: int
+    crosses_attempted: int
+    crosses_completed: int
+    dribbles_attempted: int
+    dribbles_completed: int
+    corners: int
+    throw_ins: int
+    saves: int
+    offsides: int
+
+
+@dataclass(frozen=True)
+class PlayerStats:
+    """Per-player aggregates for the table in the reports view.
+
+    Multiple track_ids belonging to the same player are pre-merged via
+    JOIN — so Petras's distance is the sum across every track he was
+    mapped to in the match.
+    """
+    player_id: int
+    kit_number: int | None
+    name: str
+    # CV-derived
+    distance_m: float
+    top_speed_kmh: float | None
+    minutes_on_pitch: float
+    # Event-derived (only counts events where this player is the actor)
+    passes_attempted: int
+    passes_completed: int
+    shots: int
+    shots_on_target: int
+    goals: int
+    tackles_won: int
+    tackles_total: int
+    fouls_committed: int
+
+
+def compute_match_stats(con: sqlite3.Connection, match_id: int) -> MatchStats:
+    """One-shot aggregate of every event-type count for a match.
+
+    Uses conditional SUMs so it's a single round-trip — faster than the
+    11 separate COUNTs we'd otherwise need. Soft-deleted events are
+    excluded (``deleted_at IS NULL`` on every count).
+    """
+    row = con.execute(
+        """
+        SELECT
+            SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END) AS total,
+            SUM(CASE WHEN event_type='pass'    AND deleted_at IS NULL THEN 1 ELSE 0 END) AS pa,
+            SUM(CASE WHEN event_type='pass'    AND success=1 AND deleted_at IS NULL THEN 1 ELSE 0 END) AS pc,
+            SUM(CASE WHEN event_type='shot'    AND deleted_at IS NULL THEN 1 ELSE 0 END) AS sh,
+            SUM(CASE WHEN event_type='shot'    AND success=1 AND deleted_at IS NULL THEN 1 ELSE 0 END) AS sot,
+            SUM(CASE WHEN event_type='goal'    AND deleted_at IS NULL THEN 1 ELSE 0 END) AS goals,
+            SUM(CASE WHEN event_type='tackle'  AND deleted_at IS NULL THEN 1 ELSE 0 END) AS ta,
+            SUM(CASE WHEN event_type='tackle'  AND success=1 AND deleted_at IS NULL THEN 1 ELSE 0 END) AS tw,
+            SUM(CASE WHEN event_type='foul'    AND deleted_at IS NULL THEN 1 ELSE 0 END) AS fl,
+            SUM(CASE WHEN event_type='cross'   AND deleted_at IS NULL THEN 1 ELSE 0 END) AS ca,
+            SUM(CASE WHEN event_type='cross'   AND success=1 AND deleted_at IS NULL THEN 1 ELSE 0 END) AS cc,
+            SUM(CASE WHEN event_type='dribble' AND deleted_at IS NULL THEN 1 ELSE 0 END) AS da,
+            SUM(CASE WHEN event_type='dribble' AND success=1 AND deleted_at IS NULL THEN 1 ELSE 0 END) AS dc,
+            SUM(CASE WHEN event_type='corner'  AND deleted_at IS NULL THEN 1 ELSE 0 END) AS ck,
+            SUM(CASE WHEN event_type='throw_in' AND deleted_at IS NULL THEN 1 ELSE 0 END) AS ti,
+            SUM(CASE WHEN event_type='save'    AND deleted_at IS NULL THEN 1 ELSE 0 END) AS sv,
+            SUM(CASE WHEN event_type='offside' AND deleted_at IS NULL THEN 1 ELSE 0 END) AS os
+        FROM events WHERE match_id = ?
+        """,
+        (match_id,),
+    ).fetchone()
+
+    def _int(v) -> int:
+        # SQLite returns None for SUM over zero rows.
+        return int(v) if v is not None else 0
+
+    return MatchStats(
+        total_events=_int(row["total"]),
+        passes_attempted=_int(row["pa"]),
+        passes_completed=_int(row["pc"]),
+        shots=_int(row["sh"]),
+        shots_on_target=_int(row["sot"]),
+        goals=_int(row["goals"]),
+        tackles_attempted=_int(row["ta"]),
+        tackles_won=_int(row["tw"]),
+        fouls_committed=_int(row["fl"]),
+        crosses_attempted=_int(row["ca"]),
+        crosses_completed=_int(row["cc"]),
+        dribbles_attempted=_int(row["da"]),
+        dribbles_completed=_int(row["dc"]),
+        corners=_int(row["ck"]),
+        throw_ins=_int(row["ti"]),
+        saves=_int(row["sv"]),
+        offsides=_int(row["os"]),
+    )
+
+
+def compute_player_stats(
+    con: sqlite3.Connection, match_id: int, team_id: int,
+) -> list[PlayerStats]:
+    """Per-player aggregates for the reports table.
+
+    Two parallel CTEs do the heavy lifting in one query:
+
+      * ``cv_stats``  — pulls per-player CV metrics by JOINing
+        ``frame_player_positions`` → ``match_track_to_player`` → ``players``.
+        Distance is computed via the SQL window function ``LAG`` on
+        successive (x, y) world coords, then summed. Top speed is just
+        ``MAX(speed_kmh)``. Minutes on pitch = (frames with any track for
+        this player) / fps / 60.
+
+      * ``event_counts`` — aggregates ``events`` per player using the
+        same join chain on ``primary_track_id``.
+
+    Both CTEs key on ``player_id`` so the outer ``LEFT JOIN`` produces
+    one row per roster player even if they have no events tagged yet
+    or no CV positions (defensive, shouldn't happen but guarded).
+    """
+    rows = con.execute(
+        """
+        WITH cv_steps AS (
+            SELECT
+                mtp.player_id,
+                fpp.frame_id,
+                fpp.track_id,
+                fpp.speed_kmh,
+                fpp.foot_x_world,
+                fpp.foot_y_world,
+                LAG(fpp.foot_x_world) OVER w AS prev_x,
+                LAG(fpp.foot_y_world) OVER w AS prev_y
+            FROM frame_player_positions fpp
+            JOIN frames f ON f.id = fpp.frame_id
+            JOIN match_track_to_player mtp
+              ON mtp.match_id = f.match_id AND mtp.track_id = fpp.track_id
+            JOIN players p ON p.id = mtp.player_id
+            WHERE f.match_id = ? AND p.team_id = ?
+            WINDOW w AS (PARTITION BY fpp.track_id ORDER BY fpp.frame_id)
+        ),
+        cv_stats AS (
+            SELECT
+                player_id,
+                COALESCE(SUM(
+                    CASE
+                        WHEN prev_x IS NOT NULL AND foot_x_world IS NOT NULL
+                        THEN SQRT(
+                            (foot_x_world - prev_x) * (foot_x_world - prev_x) +
+                            (foot_y_world - prev_y) * (foot_y_world - prev_y)
+                        )
+                        ELSE 0
+                    END
+                ), 0) AS distance_m,
+                MAX(speed_kmh) AS top_speed_kmh,
+                COUNT(DISTINCT frame_id) AS frames_on_pitch
+            FROM cv_steps
+            GROUP BY player_id
+        ),
+        event_counts AS (
+            SELECT
+                mtp.player_id,
+                SUM(CASE WHEN e.event_type='pass'    AND e.deleted_at IS NULL THEN 1 ELSE 0 END) AS pa,
+                SUM(CASE WHEN e.event_type='pass'    AND e.success=1 AND e.deleted_at IS NULL THEN 1 ELSE 0 END) AS pc,
+                SUM(CASE WHEN e.event_type='shot'    AND e.deleted_at IS NULL THEN 1 ELSE 0 END) AS sh,
+                SUM(CASE WHEN e.event_type='shot'    AND e.success=1 AND e.deleted_at IS NULL THEN 1 ELSE 0 END) AS sot,
+                SUM(CASE WHEN e.event_type='goal'    AND e.deleted_at IS NULL THEN 1 ELSE 0 END) AS goals,
+                SUM(CASE WHEN e.event_type='tackle'  AND e.deleted_at IS NULL THEN 1 ELSE 0 END) AS ta,
+                SUM(CASE WHEN e.event_type='tackle'  AND e.success=1 AND e.deleted_at IS NULL THEN 1 ELSE 0 END) AS tw,
+                SUM(CASE WHEN e.event_type='foul'    AND e.deleted_at IS NULL THEN 1 ELSE 0 END) AS fc
+            FROM events e
+            JOIN match_track_to_player mtp
+              ON mtp.match_id = e.match_id AND mtp.track_id = e.primary_track_id
+            JOIN players p ON p.id = mtp.player_id
+            WHERE e.match_id = ? AND p.team_id = ?
+            GROUP BY mtp.player_id
+        )
+        SELECT
+            p.id,
+            p.default_kit_number AS kit,
+            COALESCE(p.first_name || ' ' || p.last_name,
+                     p.first_name, p.last_name,
+                     '#' || COALESCE(p.default_kit_number, p.id)) AS name,
+            COALESCE(cv.distance_m, 0) AS distance_m,
+            cv.top_speed_kmh,
+            COALESCE(cv.frames_on_pitch, 0) AS frames_on_pitch,
+            COALESCE(ec.pa, 0)    AS pa,
+            COALESCE(ec.pc, 0)    AS pc,
+            COALESCE(ec.sh, 0)    AS sh,
+            COALESCE(ec.sot, 0)   AS sot,
+            COALESCE(ec.goals, 0) AS goals,
+            COALESCE(ec.ta, 0)    AS ta,
+            COALESCE(ec.tw, 0)    AS tw,
+            COALESCE(ec.fc, 0)    AS fc
+        FROM players p
+        LEFT JOIN cv_stats     cv ON cv.player_id = p.id
+        LEFT JOIN event_counts ec ON ec.player_id = p.id
+        WHERE p.team_id = ?
+        ORDER BY
+            CASE WHEN p.default_kit_number IS NULL THEN 1 ELSE 0 END,
+            p.default_kit_number,
+            p.id
+        """,
+        (match_id, team_id, match_id, team_id, team_id),
+    ).fetchall()
+
+    # Resolve fps from the match row to convert frames_on_pitch → minutes.
+    fps_row = con.execute(
+        "SELECT fps FROM matches WHERE id = ?", (match_id,),
+    ).fetchone()
+    fps = float(fps_row["fps"]) if fps_row else 30.0
+
+    return [
+        PlayerStats(
+            player_id=r["id"],
+            kit_number=r["kit"],
+            name=r["name"].strip(),
+            distance_m=float(r["distance_m"] or 0.0),
+            top_speed_kmh=float(r["top_speed_kmh"]) if r["top_speed_kmh"] is not None else None,
+            minutes_on_pitch=float(r["frames_on_pitch"]) / fps / 60.0,
+            passes_attempted=int(r["pa"]),
+            passes_completed=int(r["pc"]),
+            shots=int(r["sh"]),
+            shots_on_target=int(r["sot"]),
+            goals=int(r["goals"]),
+            tackles_total=int(r["ta"]),
+            tackles_won=int(r["tw"]),
+            fouls_committed=int(r["fc"]),
+        )
+        for r in rows
+    ]
+
+
 def soft_delete_event(con: sqlite3.Connection, event_id: int) -> None:
     """Mark an event as deleted (sets ``deleted_at = CURRENT_TIMESTAMP``).
 
