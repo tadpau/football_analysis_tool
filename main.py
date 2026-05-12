@@ -293,6 +293,7 @@ def run_streaming(
     analysis_stub_path: Path | None = None,
     use_analysis_stub: bool = False,
     auto_calibrate: bool = False,
+    player_conf: float | None = None,
 ) -> None:
     """Memory-bounded two-pass pipeline for full-length clips.
 
@@ -344,9 +345,21 @@ def run_streaming(
             f"({len(tracks)} frames) — skipping pass 1."
         )
     else:
+        # Per-class conf overrides — currently we only expose --player-conf
+        # via CLI but the Tracker accepts a full dict so additional knobs
+        # (ball, GK, ref) are trivial to add later.
+        conf_overrides: dict[str, float] | None = None
+        if player_conf is not None:
+            conf_overrides = {"player": float(player_conf)}
+            print(
+                f"  Player confidence threshold overridden to "
+                f"{player_conf:.2f} (default 0.30)"
+            )
+
         tracker = Tracker(
             model_path=model_path, mode=mode, imgsz=imgsz,
             frame_rate=info["fps"],
+            conf_overrides=conf_overrides,
         )
         cam_est: CameraMovementEstimator | None = None
         n_seen = 0
@@ -670,6 +683,15 @@ def main() -> None:
              "is overwritten (a fresh pass 1 always runs).",
     )
     p.add_argument(
+        "--player-conf", type=float, default=None,
+        help="Override the per-class confidence floor for the player "
+             "class (default 0.30). Lowering to 0.25 / 0.20 catches more "
+             "occluded / far-camera players in crowded scenes at the cost "
+             "of more false positives. Useful for re-running inference "
+             "against a stub-less clip to compare coverage without "
+             "retraining the model.",
+    )
+    p.add_argument(
         "--auto-calibrate", action="store_true",
         help="Compute the pitch homography per-frame from detected pitch "
              "landmarks (centre spot, corner flags, penalty spots). Requires "
@@ -700,6 +722,7 @@ def main() -> None:
             analysis_stub_path=args.analysis_stub,
             use_analysis_stub=args.use_analysis_stub,
             auto_calibrate=args.auto_calibrate,
+            player_conf=args.player_conf,
         )
         return
 

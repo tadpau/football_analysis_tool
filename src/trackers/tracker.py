@@ -166,6 +166,7 @@ class Tracker:
         minimum_matching_threshold: float = 0.7,
         stitch_max_gap_frames: int = STITCH_MAX_GAP_FRAMES,
         stitch_max_dist_px: float = STITCH_MAX_DIST_PX,
+        conf_overrides: dict[str, float] | None = None,
     ):
         self.model = YOLO(str(model_path))
         self.mode = mode
@@ -175,6 +176,14 @@ class Tracker:
             self.class_map = ClassMap.custom_landmarks()
         else:
             self.class_map = ClassMap.custom()
+
+        # Per-class minimum confidence. Defaults from DEFAULT_CONF unless
+        # the caller overrides — useful for testing how a lower
+        # player-confidence threshold affects crowded-scene coverage
+        # without retraining.
+        self.conf_thresholds: dict[str, float] = dict(DEFAULT_CONF)
+        if conf_overrides:
+            self.conf_thresholds.update(conf_overrides)
         self.batch_size = batch_size
         self.imgsz = imgsz
         self.stitch_max_gap_frames = stitch_max_gap_frames
@@ -268,7 +277,7 @@ class Tracker:
             name = self.class_map.name_of(int(cls_id))
             if name is None or name == "ball":
                 continue
-            if conf < DEFAULT_CONF[name]:
+            if conf < self.conf_thresholds[name]:
                 continue
             frame_out[name][int(track_id)] = {
                 "bbox": xyxy.tolist(),
@@ -277,7 +286,7 @@ class Tracker:
 
         if len(ball_det) > 0:
             ball_conf = ball_det.confidence
-            valid = ball_conf >= DEFAULT_CONF["ball"]
+            valid = ball_conf >= self.conf_thresholds["ball"]
             if valid.any():
                 best_idx = int(np.argmax(ball_conf * valid))
                 frame_out["ball"][1] = {
