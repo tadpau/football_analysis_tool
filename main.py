@@ -294,6 +294,7 @@ def run_streaming(
     use_analysis_stub: bool = False,
     auto_calibrate: bool = False,
     player_conf: float | None = None,
+    skip_render: bool = False,
 ) -> None:
     """Memory-bounded two-pass pipeline for full-length clips.
 
@@ -571,6 +572,17 @@ def run_streaming(
             print("  no --calibration or --auto-calibrate — skipping homography/speed.")
 
     # ---- Pass 2: render annotated frames straight to disk ------------------
+    # Skippable: the desktop event-tagger draws overlays from the DB, so
+    # for full-match Colab runs there's no reason to spend ~equal compute
+    # producing a baked-in overlay MP4. Use --skip-render to stop after
+    # the analysis stub is saved.
+    if skip_render:
+        print(
+            "Render skipped (--skip-render). Analysis stub is saved; "
+            "the desktop tagger draws overlays from the DB."
+        )
+        return
+
     # Rolling possession share — see ROLLING_HUD_SECONDS notes. Computed once,
     # then indexed per-frame in the render loop. O(n) memory, tiny dicts.
     window_frames = max(1, int(round(ROLLING_HUD_SECONDS * info["fps"])))
@@ -683,6 +695,14 @@ def main() -> None:
              "is overwritten (a fresh pass 1 always runs).",
     )
     p.add_argument(
+        "--skip-render", action="store_true",
+        help="Stop after pass 1 — don't produce the rendered overlay "
+             "MP4. The analysis stub is still written to --analysis-stub. "
+             "Cuts streaming-mode wall-clock roughly in half. Use this "
+             "for full-match Colab runs: the desktop event-tagger draws "
+             "overlays from the DB and doesn't need the baked MP4.",
+    )
+    p.add_argument(
         "--player-conf", type=float, default=None,
         help="Override the per-class confidence floor for the player "
              "class (default 0.30). Lowering to 0.25 / 0.20 catches more "
@@ -723,6 +743,7 @@ def main() -> None:
             use_analysis_stub=args.use_analysis_stub,
             auto_calibrate=args.auto_calibrate,
             player_conf=args.player_conf,
+            skip_render=args.skip_render,
         )
         return
 
