@@ -437,6 +437,62 @@ def unassign_track(
     con.commit()
 
 
+def delete_player(con: sqlite3.Connection, player_id: int) -> None:
+    """Remove a player from the roster.
+
+    Cascade-removes every ``match_track_to_player`` row referencing
+    this player across all matches (the FK doesn't have ON DELETE
+    CASCADE so we do it explicitly here). The ``events`` table is
+    untouched — events store ``primary_track_id`` (not ``player_id``)
+    so historical tags survive; the LEFT JOIN in
+    :func:`list_recent_events` just won't resolve a name for that
+    player's old tracks anymore.
+    """
+    con.execute(
+        "DELETE FROM match_track_to_player WHERE player_id = ?",
+        (player_id,),
+    )
+    con.execute("DELETE FROM players WHERE id = ?", (player_id,))
+    con.commit()
+
+
+def update_player(
+    con: sqlite3.Connection,
+    *,
+    player_id: int,
+    kit_number: int | None,
+    name: str | None,
+    propagate_kit_to_match_id: int | None = None,
+) -> None:
+    """Rename or renumber a roster entry.
+
+    When ``propagate_kit_to_match_id`` is provided, the player's
+    ``match_track_to_player.kit_number_in_match`` rows for THAT match
+    are updated to the new kit too. Without that flag, only the
+    player's default kit changes — useful when the player legitimately
+    wore a different kit in this specific match.
+    """
+    first, last = None, None
+    if name:
+        n = name.strip()
+        if " " in n:
+            first, last = n.split(" ", 1)
+        else:
+            first = n
+    con.execute(
+        "UPDATE players SET default_kit_number = ?, "
+        "first_name = ?, last_name = ? WHERE id = ?",
+        (kit_number, first, last, player_id),
+    )
+    if propagate_kit_to_match_id is not None:
+        con.execute(
+            "UPDATE match_track_to_player SET kit_number_in_match = ? "
+            "WHERE match_id = ? AND player_id = ?",
+            (kit_number, propagate_kit_to_match_id, player_id),
+        )
+    con.commit()
+
+
 @dataclass(frozen=True)
 class RosterEntry:
     """One row of the roster panel — a player + how many tracks in the

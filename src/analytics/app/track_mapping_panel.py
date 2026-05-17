@@ -32,12 +32,17 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QButtonGroup,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
+    QMessageBox,
     QPushButton,
     QRadioButton,
     QSpinBox,
@@ -52,12 +57,14 @@ from .repository import (
     TrackLabel,
     TrackMapping,
     assign_track_to_player,
+    delete_player,
     dominant_team_side,
     get_match_teams,
     get_or_create_player,
     list_roster_with_track_counts,
     list_track_mappings,
     unassign_track,
+    update_player,
 )
 
 
@@ -132,6 +139,14 @@ class TrackMappingPanel(QWidget):
 
         self._roster_list = QListWidget()
         self._roster_list.itemClicked.connect(self._on_roster_click)
+        # Right-click a roster row → Edit / Remove. Mistypes during the
+        # add-player phase are the most common roster-management need.
+        self._roster_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self._roster_list.customContextMenuRequested.connect(
+            self._on_roster_context_menu
+        )
         roster_layout.addWidget(self._roster_list)
 
         # Inline "+ Add player" form — kit + optional name + Add button.
@@ -315,6 +330,77 @@ class TrackMappingPanel(QWidget):
         self.mappings_changed.emit()
         self.set_selected_track(self._selected_track)
 
+    # -------------------------------------------------- roster edit/delete
+    def _on_roster_context_menu(self, pos) -> None:
+        """Right-click on a roster row — offer Edit + Remove."""
+        item = self._roster_list.itemAt(pos)
+        if item is None:
+            return
+        player_id = item.data(Qt.ItemDataRole.UserRole)
+        if player_id is None:
+            return   # the empty-state placeholder row
+
+        menu = QMenu(self)
+        edit_action = menu.addAction("Edit player…")
+        remove_action = menu.addAction("Remove from roster…")
+        chosen = menu.exec(self._roster_list.mapToGlobal(pos))
+        if chosen == edit_action:
+            self._edit_player(int(player_id), item.text())
+        elif chosen == remove_action:
+            self._remove_player(int(player_id), item.text())
+
+    def _edit_player(self, player_id: int, current_row_text: str) -> None:
+        # Find current kit + name from the roster row so we can prefill
+        # the dialog. Easier than re-querying.
+        roster = list_roster_with_track_counts(
+            self._con, self._match.id, self._tagging_team.id,
+        )
+        target = next((r for r in roster if r.player_id == player_id), None)
+        if target is None:
+            return
+        dlg = _PlayerEditDialog(
+            self,
+            initial_kit=target.kit_number or 0,
+            initial_name=target.name or "",
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_kit, new_name = dlg.values()
+        update_player(
+            self._con,
+            player_id=player_id,
+            kit_number=new_kit if new_kit > 0 else None,
+            name=new_name or None,
+            # Propagate kit changes to this match's mappings so the
+            # overlay labels + event ratios pick up the new kit number
+            # without a re-mapping pass.
+            propagate_kit_to_match_id=self._match.id,
+        )
+        self._refresh_roster()
+        self.mappings_changed.emit()
+
+    def _remove_player(self, player_id: int, current_row_text: str) -> None:
+        # Big warning — cascade-removes every track mapping referencing
+        # this player across ALL matches. Events stay (they store
+        # track_id, not player_id) but their resolved player name will
+        # blank out.
+        confirm = QMessageBox.question(
+            self,
+            "Remove player from roster?",
+            f"Remove <b>{current_row_text}</b> from the roster?<br><br>"
+            f"All track mappings to this player (in this and every other "
+            f"match) will be deleted. Events tagged to those tracks survive "
+            f"but will display as raw track IDs until you re-map them.<br><br>"
+            f"This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        delete_player(self._con, player_id)
+        self._refresh_roster()
+        self.mappings_changed.emit()
+
     # ---------------------------------------------------------- internals
     def _refresh_roster(self) -> None:
         roster = list_roster_with_track_counts(
@@ -343,3 +429,45 @@ class TrackMappingPanel(QWidget):
             empty.setFlags(Qt.ItemFlag.NoItemFlags)
             empty.setForeground(Qt.GlobalColor.gray)
             self._roster_list.addItem(empty)
+
+
+# ---------------------------------------------------------------------------
+# Player-edit dialog. Used by TrackMappingPanel._edit_player to rename or
+# renumber an existing roster entry. Two fields, OK/Cancel — deliberately
+# minimal so the right-click → Edit flow stays a one-second operation.
+# ---------------------------------------------------------------------------
+class _PlayerEditDialog(QDialog):
+    def __init__(
+        self, parent: QWidget, *, initial_kit: int, initial_name: str,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Edit player")
+        self.setMinimumWidth(320)
+
+        form = QFormLayout()
+        self._kit = QSpinBox()
+        self._kit.setRange(0, 99)
+        self._kit.setSpecialValueText(" ")
+        self._kit.setValue(initial_kit if initial_kit > 0 else 0)
+        form.addRow("Kit number:", self._kit)
+        self._name = QLineEdit()
+        self._name.setText(initial_name)
+        self._name.setPlaceholderText("(optional)")
+        form.addRow("Player name:", self._name)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        outer = QVBoxLayout(self)
+        outer.addLayout(form)
+        outer.addWidget(buttons)
+
+    def values(self) -> tuple[int, str]:
+        """Return ``(kit_number, name)``. ``kit_number == 0`` means
+        "no kit number" (consistent with the QSpinBox specialValueText)."""
+        return self._kit.value(), self._name.text().strip()

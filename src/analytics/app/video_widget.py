@@ -212,9 +212,21 @@ def render_overlays(
     for p in players:
         color = _color_for(p)
         mapped = labels.get(p.track_id)
-        if mapped is not None and (
-            p.team is None or p.team == mapped.expected_team_side
-        ):
+        # STRICT team-side gate: only paint the mapped name when the
+        # current frame's CV team classification matches the team_side
+        # that was stored at mapping time. This is what catches
+        # ByteTrack ID reuse — when track 47 first belonged to a home
+        # player and later gets recycled onto an opposite-team player,
+        # the current frame's team will be 2 (away) while the mapping
+        # expected 1 (home), so the mismatch falls through to the
+        # track_id label.
+        #
+        # Previously this also allowed ``p.team is None`` as a
+        # permissive "trust the mapping when CV is uncertain" path —
+        # but that turned out to be the cross-team leak path. Better
+        # to flicker the name off for one frame during an ambiguous
+        # team-assignment call than to mis-attribute clicks + events.
+        if mapped is not None and p.team == mapped.expected_team_side:
             label = mapped.text
         else:
             label = str(p.track_id)
