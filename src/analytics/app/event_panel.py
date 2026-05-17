@@ -376,6 +376,20 @@ class EventPanel(QWidget):
             notes=None,
         )
 
+        # Auto-promote the receiver to primary on a successful pass /
+        # cross. The natural football flow is "A passes to B, then B
+        # does something next" — without this the operator would have to
+        # re-click B before tagging their next event. Restricted to
+        # success=1 because a failed pass means possession is gone, so
+        # auto-promoting the intended receiver would be misleading.
+        if (
+            self._pending_event.code in ("pass", "cross")
+            and success == 1
+            and self._secondary_track is not None
+        ):
+            self._primary_track = self._secondary_track
+            self._primary_label = self._secondary_label
+
         self._pending_event = None
         self._secondary_track = None
         self._secondary_label = ""
@@ -384,7 +398,8 @@ class EventPanel(QWidget):
         self.event_logged.emit()
         self._update_banner()
         # Primary stays selected — operator usually tags multiple events
-        # for the same player in a row.
+        # for the same player in a row. Receiver becomes primary on
+        # successful pass/cross (see auto-promote above).
 
     def _update_banner(self) -> None:
         bg = _BANNER_COLORS[self._state]

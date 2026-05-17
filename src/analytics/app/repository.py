@@ -541,6 +541,24 @@ class EventRow:
     notes: str | None
 
 
+def ensure_event_types(con: sqlite3.Connection) -> None:
+    """Idempotently insert any event types added after the initial
+    schema seed. Lets older DBs pick up new vocabulary (e.g.
+    Lost ball / Won ball) without a destructive migration."""
+    rows = [
+        ("lost_ball", "Lost ball", "l", 0, 0, 62),
+        ("won_ball",  "Won ball",  "w", 0, 0, 64),
+    ]
+    for row in rows:
+        con.execute(
+            "INSERT OR IGNORE INTO event_types "
+            "(code, label, hotkey, has_success, has_secondary, sort_order) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            row,
+        )
+    con.commit()
+
+
 def list_event_types(con: sqlite3.Connection) -> list[EventType]:
     """Read the seeded vocabulary. Stable across runs unless someone
     INSERTs into ``event_types`` directly."""
@@ -1033,9 +1051,14 @@ def get_player_event_locations(
 def get_team_world_positions(
     con: sqlite3.Connection, match_id: int, team_side: int,
 ) -> list[tuple[float, float]]:
-    """Every (x, y) world coord stamped on ``frame_player_positions``
-    for the given CV-detected ``team_side``. Used by the reports view
-    to build a 2D occupancy histogram for the team heatmap.
+    """Every (x, y) world coord for the given team_side.
+
+    For tracks the operator has mapped, the team comes from
+    ``match_track_to_player.team_side`` (locked at mapping time, so
+    immune to per-frame team_assigner flicker). For unmapped tracks,
+    falls back to the per-frame CV team. The COALESCE pushes mapped
+    tracks' positions consistently to the correct team's heatmap even
+    when individual frames of the team_assigner disagreed.
 
     Skips rows without world coords (frames before homography
     converged, refs that drifted off the calibrated quad, etc.).
@@ -1045,8 +1068,10 @@ def get_team_world_positions(
         SELECT fpp.foot_x_world, fpp.foot_y_world
         FROM frame_player_positions fpp
         JOIN frames f ON f.id = fpp.frame_id
+        LEFT JOIN match_track_to_player mtp
+          ON mtp.match_id = f.match_id AND mtp.track_id = fpp.track_id
         WHERE f.match_id = ?
-          AND fpp.team = ?
+          AND COALESCE(mtp.team_side, fpp.team) = ?
           AND fpp.foot_x_world IS NOT NULL
           AND fpp.foot_y_world IS NOT NULL
         """,

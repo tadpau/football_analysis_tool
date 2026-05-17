@@ -39,7 +39,7 @@ from PyQt6.QtWidgets import (
 from ..db.connection import open_db
 from .event_panel import EventPanel
 from .reports_widget import ReportsWidget
-from .repository import MatchSummary, get_match, list_matches
+from .repository import MatchSummary, ensure_event_types, get_match, list_matches
 from .track_mapping_panel import TrackMappingPanel
 from .video_widget import VideoWidget
 
@@ -277,6 +277,10 @@ class MainWindow(QMainWindow):
         # SQLite handles multiple cursors on one connection fine for
         # our access pattern.
         self._con = open_db(db_path)
+        # Backfill any event_types added after the DB was first created
+        # (Lost ball / Won ball were added in a later version). Safe to
+        # run on every startup — INSERT OR IGNORE per row.
+        ensure_event_types(self._con)
         self._db_path = db_path
 
         # Currently-open match + its lazy reports widget. Both stay

@@ -32,8 +32,10 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QImage, QMouseEvent, QPixmap
+from PyQt6.QtGui import QImage, QKeySequence, QMouseEvent, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
+    QApplication,
+    QLineEdit,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -210,26 +212,45 @@ def render_overlays(
     canvas = bgr.copy()
     labels = track_labels or {}
     for p in players:
-        color = _color_for(p)
         mapped = labels.get(p.track_id)
-        # STRICT team-side gate: only paint the mapped name when the
-        # current frame's CV team classification matches the team_side
-        # that was stored at mapping time. This is what catches
-        # ByteTrack ID reuse — when track 47 first belonged to a home
-        # player and later gets recycled onto an opposite-team player,
-        # the current frame's team will be 2 (away) while the mapping
-        # expected 1 (home), so the mismatch falls through to the
-        # track_id label.
-        #
-        # Previously this also allowed ``p.team is None`` as a
-        # permissive "trust the mapping when CV is uncertain" path —
-        # but that turned out to be the cross-team leak path. Better
-        # to flicker the name off for one frame during an ambiguous
-        # team-assignment call than to mis-attribute clicks + events.
-        if mapped is not None and p.team == mapped.expected_team_side:
-            label = mapped.text
+
+        # --- Colour selection ---
+        # GK / referee classes always win — they're rendered with their
+        # class-specific colour regardless of mapping or CV team.
+        # For 'player' class:
+        #   * mapped track → lock to the mapping's stored team_side.
+        #     Eliminates colour flicker on home-team players when the
+        #     team_assigner briefly drops them to None / opposite team.
+        #   * unmapped track → use the per-frame CV team (with a gray
+        #     fallback for None).
+        if p.cls == "goalkeeper":
+            color = _GK_BGR
+        elif p.cls == "referee":
+            color = _REF_BGR
+        elif mapped is not None:
+            color = _TEAM_FALLBACK_BGR.get(
+                mapped.expected_team_side, (200, 200, 200),
+            )
+        elif p.team in (1, 2):
+            color = _TEAM_FALLBACK_BGR[p.team]
         else:
+            color = (200, 200, 200)
+
+        # --- Label selection ---
+        # Unmapped tracks render with NO label box — keeps the opposing
+        # team's overlay visually clean (the operator only cares that
+        # it's the right colour, not what its raw track_id is).
+        # Mapped tracks paint the mapped name unless the current frame's
+        # CV team is the strict OPPOSITE of the mapping (a strong
+        # indicator that ByteTrack reused this track_id for a player
+        # on the other team — the cross-team leak case).
+        if mapped is None:
+            label = None
+        elif p.team is not None and p.team != mapped.expected_team_side:
             label = str(p.track_id)
+        else:
+            label = mapped.text
+
         _draw_ellipse(canvas, p, color, label)
         if p.track_id == selected_track_id and p.cls != "ball":
             cx = int((p.bbox_x1 + p.bbox_x2) * 0.5)
@@ -342,8 +363,25 @@ class VideoWidget(QWidget):
         self._timer.timeout.connect(self._on_tick)
         self._playing = False
 
+        # Space-bar play/pause toggle. WindowShortcut scope so it fires
+        # regardless of which widget has focus — operator shouldn't have
+        # to move the mouse back to the ▶ button between tags. We bail
+        # out if a text input has focus so the operator can still type
+        # spaces into the player name field.
+        self._play_shortcut = QShortcut(
+            QKeySequence("Space"), self,
+            context=Qt.ShortcutContext.WindowShortcut,
+        )
+        self._play_shortcut.activated.connect(self._on_space_pressed)
+
         # Show the first frame immediately.
         self.show_frame(0)
+
+    def _on_space_pressed(self) -> None:
+        focused = QApplication.focusWidget()
+        if isinstance(focused, QLineEdit):
+            return   # let the operator type a literal space
+        self.toggle_play()
 
     # ---------------------------------------------------------- transport
     def toggle_play(self) -> None:

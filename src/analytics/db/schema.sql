@@ -223,6 +223,8 @@ INSERT INTO event_types (code, label, hotkey, has_success, has_secondary, sort_o
     ('dribble',    'Dribble',        'd', 1, 0, 40),
     ('tackle',     'Tackle',         't', 1, 1, 50),   -- success = won the ball; secondary = opponent
     ('foul',       'Foul',           'f', 0, 1, 60),   -- secondary = fouled player
+    ('lost_ball',  'Lost ball',      'l', 0, 0, 62),   -- player lost possession (not a tackle)
+    ('won_ball',   'Won ball',       'w', 0, 0, 64),   -- player gained possession (not a tackle)
     ('throw_in',   'Throw-in',       'i', 0, 0, 70),
     ('corner',     'Corner',         'k', 0, 0, 80),
     ('goal',       'Goal',           'g', 0, 1, 90),   -- secondary = assist provider
