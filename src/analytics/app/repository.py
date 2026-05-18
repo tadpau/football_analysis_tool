@@ -317,38 +317,120 @@ def list_track_mappings(
 class TrackLabel:
     """Overlay-rendering payload for a mapped track.
 
-    ``expected_team_side`` is the CV-detected team the track had when
-    the operator assigned it. Used by the renderer to suppress the
-    name when the same track_id later resurfaces with the OPPOSITE
-    team's colour — that's ByteTrack reusing a freed ID for a new
-    physical player on the other team, and showing the original name
-    on it would actively mislead the operator.
+    The renderer combines three gates to decide whether to paint:
+
+    * ``expected_team_side`` — the CV-detected team when the operator
+      assigned the mapping. If the current frame's CV team is the
+      strict opposite, fall back to the raw track_id (catches the
+      ByteTrack-ID-reuse + correctly-classified case).
+
+    * ``valid_start`` / ``valid_end`` — the contiguous frame range of
+      the track segment that included the operator's mapping moment.
+      Outside this range (i.e. before the mapped player was on screen,
+      or after they left for >120 frames), the same track_id is most
+      likely a reused ID for a different physical player. Render
+      falls back to raw track_id.
     """
     text: str
     expected_team_side: int
+    valid_start: int   # inclusive frame_number
+    valid_end: int     # inclusive frame_number
 
 
-def get_track_labels(
+# ByteTrack's lost_track_buffer in our Tracker config = 120 frames
+# (~4 s @ 30 fps). After a track has been missing this long, ByteTrack
+# may recycle the same id for a different player. A gap of this size
+# in a single track_id's appearances is the operational signal for
+# "this is a different physical player from here on".
+GAP_THRESHOLD_FRAMES = 120
+
+
+def compute_valid_track_ranges(
     con: sqlite3.Connection, match_id: int,
-) -> dict[int, TrackLabel]:
-    """Compact ``{track_id: TrackLabel}`` dict the video widget renders.
+) -> dict[int, tuple[int, int]]:
+    """For each mapped track in the match, find the contiguous frame
+    range containing the operator's ``mapped_at_frame``.
 
-    The renderer should ONLY display the label when the current
-    frame's ``team`` matches ``expected_team_side`` (or when the
-    frame's team is None — too ambiguous to override).
+    Returns ``{track_id: (start_frame, end_frame)}`` with both ends
+    inclusive. Tracks with a NULL ``mapped_at_frame`` (legacy mappings
+    created before the column was added) fall back to the match's
+    full frame range — i.e. no gap-based gating.
     """
-    out: dict[int, TrackLabel] = {}
-    for m in list_track_mappings(con, match_id):
-        kit = m.kit_number if m.kit_number is not None else "?"
-        # Truncate name to keep label short — overlays sit close together.
-        name = m.player_name.strip()
-        if len(name) > 12:
-            name = name[:11] + "…"
-        out[m.track_id] = TrackLabel(
-            text=f"{kit} {name}".strip(),
-            expected_team_side=m.team_side,
+    n_row = con.execute(
+        "SELECT n_frames_analysed FROM matches WHERE id = ?", (match_id,),
+    ).fetchone()
+    if n_row is None:
+        return {}
+    n_frames = int(n_row["n_frames_analysed"])
+
+    mapping_rows = con.execute(
+        "SELECT track_id, mapped_at_frame FROM match_track_to_player "
+        "WHERE match_id = ?",
+        (match_id,),
+    ).fetchall()
+    if not mapping_rows:
+        return {}
+
+    # One query to pull every (track_id, frame_number) for the mapped
+    # tracks. Grouped in Python — Python's dict/list ops are faster than
+    # round-tripping per track via sqlite for a few hundred mapped tracks.
+    track_frames: dict[int, list[int]] = {}
+    rows = con.execute(
+        """
+        SELECT fpp.track_id, f.frame_number
+        FROM frame_player_positions fpp
+        JOIN frames f ON f.id = fpp.frame_id
+        WHERE f.match_id = ?
+          AND fpp.track_id IN (
+              SELECT track_id FROM match_track_to_player WHERE match_id = ?
+          )
+        ORDER BY fpp.track_id, f.frame_number
+        """,
+        (match_id, match_id),
+    )
+    for row in rows:
+        track_frames.setdefault(int(row["track_id"]), []).append(
+            int(row["frame_number"])
         )
-    return out
+
+    ranges: dict[int, tuple[int, int]] = {}
+    for m in mapping_rows:
+        tid = int(m["track_id"])
+        mapped_at = m["mapped_at_frame"]
+        frames = track_frames.get(tid, [])
+
+        # Legacy mapping (or weird "no appearances" case) — treat as
+        # valid across the whole match. This preserves the old behaviour
+        # for mappings created before the gap-detection landed.
+        if mapped_at is None or not frames:
+            ranges[tid] = (0, max(0, n_frames - 1))
+            continue
+
+        # Find the appearance closest to mapped_at (operator might have
+        # been on a frame where this track wasn't detected — pick the
+        # nearest visible frame).
+        mapped_at = int(mapped_at)
+        if mapped_at in frames:
+            i = frames.index(mapped_at)
+        else:
+            i = min(range(len(frames)), key=lambda k: abs(frames[k] - mapped_at))
+
+        # Expand left while gap <= threshold.
+        j = i
+        while j > 0 and (frames[j] - frames[j - 1]) <= GAP_THRESHOLD_FRAMES:
+            j -= 1
+        start = frames[j]
+        # Expand right.
+        j = i
+        while (
+            j < len(frames) - 1
+            and (frames[j + 1] - frames[j]) <= GAP_THRESHOLD_FRAMES
+        ):
+            j += 1
+        end = frames[j]
+        ranges[tid] = (start, end)
+
+    return ranges
 
 
 def get_or_create_player(
@@ -403,24 +485,35 @@ def assign_track_to_player(
     player_id: int,
     team_side: int,
     kit_number_in_match: int | None,
+    mapped_at_frame: int | None = None,
 ) -> None:
     """Insert (or replace) the ``match_track_to_player`` row.
 
+    ``mapped_at_frame`` is the video frame_number the operator was on
+    when they clicked Assign. Used downstream to scope the mapping's
+    validity to that frame's contiguous track-appearance segment —
+    defends against ByteTrack track_id reuse leaking the label /
+    heatmap positions to a different physical player.
+
     Replacing on conflict means the operator can re-assign a track
-    (mistake, kit changed mid-match, …) just by repeating the action —
-    the latest assignment wins.
+    (mistake, kit changed mid-match, ID reuse spotted) just by
+    repeating the action — the latest assignment wins, with a fresh
+    ``mapped_at_frame``.
     """
     con.execute(
         """
         INSERT INTO match_track_to_player
-            (match_id, track_id, player_id, team_side, kit_number_in_match)
-        VALUES (?, ?, ?, ?, ?)
+            (match_id, track_id, player_id, team_side,
+             kit_number_in_match, mapped_at_frame)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(match_id, track_id) DO UPDATE SET
             player_id = excluded.player_id,
             team_side = excluded.team_side,
-            kit_number_in_match = excluded.kit_number_in_match
+            kit_number_in_match = excluded.kit_number_in_match,
+            mapped_at_frame = excluded.mapped_at_frame
         """,
-        (match_id, track_id, player_id, team_side, kit_number_in_match),
+        (match_id, track_id, player_id, team_side,
+         kit_number_in_match, mapped_at_frame),
     )
     con.commit()
 
@@ -539,6 +632,27 @@ class EventRow:
     secondary_kit: int | None
     success: int | None
     notes: str | None
+
+
+def ensure_schema_additions(con: sqlite3.Connection) -> None:
+    """Idempotent migrations for columns added after the initial schema.
+
+    Currently:
+      * ``match_track_to_player.mapped_at_frame`` — added for ID-reuse
+        gap detection. The render + heatmap paths use this to scope
+        each mapping to the contiguous track segment it was created in.
+    """
+    cols = {
+        row[1] for row in con.execute(
+            "PRAGMA table_info(match_track_to_player)"
+        ).fetchall()
+    }
+    if "mapped_at_frame" not in cols:
+        con.execute(
+            "ALTER TABLE match_track_to_player "
+            "ADD COLUMN mapped_at_frame INTEGER"
+        )
+        con.commit()
 
 
 def ensure_event_types(con: sqlite3.Connection) -> None:
@@ -1053,16 +1167,45 @@ def get_team_world_positions(
 ) -> list[tuple[float, float]]:
     """Every (x, y) world coord for the given team_side.
 
-    For tracks the operator has mapped, the team comes from
-    ``match_track_to_player.team_side`` (locked at mapping time, so
-    immune to per-frame team_assigner flicker). For unmapped tracks,
-    falls back to the per-frame CV team. The COALESCE pushes mapped
-    tracks' positions consistently to the correct team's heatmap even
-    when individual frames of the team_assigner disagreed.
+    For tracks the operator has mapped, the team comes from the
+    mapping's ``team_side`` ONLY within the mapping's valid frame
+    range (the contiguous track segment around ``mapped_at_frame``).
+    Outside that range — i.e. frames where the same track_id has been
+    recycled by ByteTrack for a different physical player — the
+    mapping is ignored and we fall back to the per-frame CV team.
+
+    This is what stops a recycled track_id from polluting the mapped
+    player's heatmap with positions of a different player who reused
+    the same id later in the match.
 
     Skips rows without world coords (frames before homography
     converged, refs that drifted off the calibrated quad, etc.).
     """
+    # Compute the in-Python valid ranges once and pass them to SQL as a
+    # filter. SQL alone can't do this efficiently — gap detection on
+    # consecutive frame_numbers per track is awkward in pure SQL and
+    # we'd be running it per position row.
+    ranges = compute_valid_track_ranges(con, match_id)
+
+    # We need positions where:
+    #   * For each mapped track, ONLY frames inside its valid range
+    #     count against the mapping's team_side; outside frames fall
+    #     back to fpp.team (per-frame CV).
+    #   * For unmapped tracks, always fall back to fpp.team.
+    # Express in SQL via a derived column built from the ranges dict.
+    # For correctness we materialise the ranges as a temp table.
+    con.execute("DROP TABLE IF EXISTS _track_valid_ranges")
+    con.execute(
+        "CREATE TEMP TABLE _track_valid_ranges "
+        "(track_id INTEGER PRIMARY KEY, valid_start INTEGER, valid_end INTEGER)"
+    )
+    if ranges:
+        con.executemany(
+            "INSERT INTO _track_valid_ranges (track_id, valid_start, valid_end) "
+            "VALUES (?, ?, ?)",
+            [(tid, s, e) for tid, (s, e) in ranges.items()],
+        )
+
     rows = con.execute(
         """
         SELECT fpp.foot_x_world, fpp.foot_y_world
@@ -1070,13 +1213,30 @@ def get_team_world_positions(
         JOIN frames f ON f.id = fpp.frame_id
         LEFT JOIN match_track_to_player mtp
           ON mtp.match_id = f.match_id AND mtp.track_id = fpp.track_id
+        LEFT JOIN _track_valid_ranges vr
+          ON vr.track_id = fpp.track_id
         WHERE f.match_id = ?
-          AND COALESCE(mtp.team_side, fpp.team) = ?
           AND fpp.foot_x_world IS NOT NULL
           AND fpp.foot_y_world IS NOT NULL
+          AND (
+            -- in-range mapped track → mapping's team_side counts
+            (mtp.team_side IS NOT NULL
+             AND vr.valid_start IS NOT NULL
+             AND f.frame_number BETWEEN vr.valid_start AND vr.valid_end
+             AND mtp.team_side = ?)
+            OR
+            -- unmapped OR out-of-range mapped → per-frame CV team counts
+            ((mtp.team_side IS NULL
+              OR vr.valid_start IS NULL
+              OR f.frame_number < vr.valid_start
+              OR f.frame_number > vr.valid_end)
+             AND fpp.team = ?)
+          )
         """,
-        (match_id, team_side),
+        (match_id, team_side, team_side),
     ).fetchall()
+    con.execute("DROP TABLE _track_valid_ranges")
+
     return [(float(r["foot_x_world"]), float(r["foot_y_world"])) for r in rows]
 
 

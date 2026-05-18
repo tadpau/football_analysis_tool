@@ -188,6 +188,7 @@ def render_overlays(
     ball: FrameBallPos | None,
     selected_track_id: int | None,
     track_labels: dict[int, TrackLabel] | None = None,
+    current_frame_number: int = 0,
 ) -> np.ndarray:
     """Draw player ellipses + ball triangle + labels on a BGR frame.
 
@@ -212,17 +213,31 @@ def render_overlays(
     canvas = bgr.copy()
     labels = track_labels or {}
     for p in players:
-        mapped = labels.get(p.track_id)
+        raw_mapped = labels.get(p.track_id)
+
+        # --- ID-reuse gap gate ---
+        # A mapping is only trusted within the contiguous track segment
+        # that contained the operator's ``mapped_at_frame``. Outside
+        # that range, ByteTrack has almost certainly reused this
+        # track_id for a different physical player — treat the
+        # detection as unmapped for both colour and label.
+        if raw_mapped is not None and not (
+            raw_mapped.valid_start <= current_frame_number <= raw_mapped.valid_end
+        ):
+            mapped = None
+        else:
+            mapped = raw_mapped
 
         # --- Colour selection ---
         # GK / referee classes always win — they're rendered with their
         # class-specific colour regardless of mapping or CV team.
         # For 'player' class:
-        #   * mapped track → lock to the mapping's stored team_side.
-        #     Eliminates colour flicker on home-team players when the
-        #     team_assigner briefly drops them to None / opposite team.
-        #   * unmapped track → use the per-frame CV team (with a gray
-        #     fallback for None).
+        #   * in-range mapped track → lock to the mapping's stored
+        #     team_side. Eliminates colour flicker on home-team players
+        #     when the team_assigner briefly drops them to None / the
+        #     opposite team.
+        #   * unmapped (or out-of-range) track → use the per-frame CV
+        #     team (with a gray fallback for None).
         if p.cls == "goalkeeper":
             color = _GK_BGR
         elif p.cls == "referee":
@@ -237,13 +252,13 @@ def render_overlays(
             color = (200, 200, 200)
 
         # --- Label selection ---
-        # Unmapped tracks render with NO label box — keeps the opposing
-        # team's overlay visually clean (the operator only cares that
-        # it's the right colour, not what its raw track_id is).
-        # Mapped tracks paint the mapped name unless the current frame's
-        # CV team is the strict OPPOSITE of the mapping (a strong
-        # indicator that ByteTrack reused this track_id for a player
-        # on the other team — the cross-team leak case).
+        # Unmapped (and out-of-range mapped) tracks render with NO
+        # label box — keeps the opposing team's overlay visually clean.
+        # In-range mapped tracks paint the mapped name unless the
+        # current frame's CV team is the strict OPPOSITE of the
+        # mapping (a strong indicator that ByteTrack reused this
+        # track_id mid-segment for an opposite-team player — rare but
+        # possible).
         if mapped is None:
             label = None
         elif p.team is not None and p.team != mapped.expected_team_side:
@@ -446,6 +461,7 @@ class VideoWidget(QWidget):
         rendered = render_overlays(
             self._last_bgr, players, ball, self._selected_track_id,
             track_labels=self._track_labels,
+            current_frame_number=self._current_frame_number,
         )
         self._surface.show_frame(rendered)
 
@@ -470,6 +486,7 @@ class VideoWidget(QWidget):
         rendered = render_overlays(
             bgr, players, ball, self._selected_track_id,
             track_labels=self._track_labels,
+            current_frame_number=frame_number,
         )
         self._surface.show_frame(rendered)
 

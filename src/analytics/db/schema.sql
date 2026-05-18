@@ -121,6 +121,15 @@ CREATE TABLE match_track_to_player (
     -- without joining all the way back to teams.
     team_side           INTEGER NOT NULL CHECK(team_side IN (1, 2)),
     kit_number_in_match INTEGER,                -- override default_kit_number
+    -- Frame number the operator was looking at when this mapping was
+    -- created. ByteTrack eventually reuses track_ids — typically after
+    -- a player is missing for >lost_track_buffer (120 frames). By
+    -- remembering when the operator MAPPED this track_id, we can
+    -- restrict the mapping's validity to the contiguous appearance
+    -- segment that included that frame. Frames where the same
+    -- track_id reappears AFTER a long gap are treated as a recycled
+    -- (different) player.
+    mapped_at_frame     INTEGER,
     PRIMARY KEY (match_id, track_id)
 );
 

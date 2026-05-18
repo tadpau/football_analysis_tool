@@ -57,6 +57,7 @@ from .repository import (
     TrackLabel,
     TrackMapping,
     assign_track_to_player,
+    compute_valid_track_ranges,
     delete_player,
     dominant_team_side,
     get_match_teams,
@@ -91,6 +92,11 @@ class TrackMappingPanel(QWidget):
 
         # Currently selected CV track (set by main window on video click).
         self._selected_track: int | None = None
+        # Current video frame_number — updated via set_current_frame as
+        # the operator scrubs. Stored on every new mapping so the
+        # render + heatmap paths can scope the mapping to the track's
+        # contiguous appearance segment around this frame.
+        self._current_frame: int = 0
 
         self.setFixedWidth(380)
         self.setStyleSheet(
@@ -198,6 +204,13 @@ class TrackMappingPanel(QWidget):
         self._refresh_roster()
 
     # ------------------------------------------------------------ public
+    def set_current_frame(self, frame_number: int) -> None:
+        """Called by the main window on every video frame change.
+        Used to stamp ``mapped_at_frame`` when the operator assigns a
+        track, so the mapping can later be scoped to that frame's
+        contiguous appearance segment of the track."""
+        self._current_frame = frame_number
+
     def set_selected_track(self, track_id: int) -> None:
         """Called by the main window when the operator clicks the video."""
         self._selected_track = track_id
@@ -233,20 +246,27 @@ class TrackMappingPanel(QWidget):
         have been mapped to a roster player. Untagged tracks (and any
         tracks on the OTHER team) keep showing their raw track_id.
 
-        Returns ``TrackLabel`` instances carrying both the display text
-        AND the team_side stored at mapping time, so the renderer can
-        refuse to paint the label when ByteTrack later reuses the same
-        track_id for a player on the OPPOSITE team's colour.
+        Each ``TrackLabel`` carries:
+          * the text to paint (kit + name);
+          * the CV team_side at mapping time (strict opposite ⇒ ID
+            reuse, suppress label);
+          * the contiguous valid frame range for the mapping (frames
+            outside this range ⇒ same track_id, different physical
+            player, suppress label).
         """
+        ranges = compute_valid_track_ranges(self._con, self._match.id)
         out: dict[int, TrackLabel] = {}
         for m in list_track_mappings(self._con, self._match.id):
             kit = m.kit_number if m.kit_number is not None else "?"
             name = m.player_name.strip()
             if len(name) > 12:
                 name = name[:11] + "…"
+            start, end = ranges.get(m.track_id, (0, 0))
             out[m.track_id] = TrackLabel(
                 text=f"{kit} {name}".strip(),
                 expected_team_side=m.team_side,
+                valid_start=start,
+                valid_end=end,
             )
         return out
 
@@ -314,6 +334,7 @@ class TrackMappingPanel(QWidget):
             player_id=player_id,
             team_side=side,
             kit_number_in_match=kit_in_match,
+            mapped_at_frame=self._current_frame,
         )
         # Refresh visuals immediately.
         self._refresh_roster()

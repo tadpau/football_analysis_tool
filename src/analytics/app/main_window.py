@@ -39,7 +39,13 @@ from PyQt6.QtWidgets import (
 from ..db.connection import open_db
 from .event_panel import EventPanel
 from .reports_widget import ReportsWidget
-from .repository import MatchSummary, ensure_event_types, get_match, list_matches
+from .repository import (
+    MatchSummary,
+    ensure_event_types,
+    ensure_schema_additions,
+    get_match,
+    list_matches,
+)
 from .track_mapping_panel import TrackMappingPanel
 from .video_widget import VideoWidget
 
@@ -214,8 +220,10 @@ class TaggerWidget(QWidget):
         # actor" for the next hotkey press.
         self._video.player_clicked.connect(self._on_video_player_clicked)
         # Frame change → events panel needs to know which frame_id to
-        # attach future events to.
+        # attach future events to. Tracks panel needs it for the
+        # mapped_at_frame stamp on each new assignment.
         self._video.frame_changed.connect(self._events_panel.set_current_frame)
+        self._video.frame_changed.connect(self._tracks_panel.set_current_frame)
         # Players panel changed mappings → repush labels into the video
         # overlay AND tell the events panel about any new tagging-team flip.
         self._tracks_panel.mappings_changed.connect(self._on_mappings_changed)
@@ -277,9 +285,11 @@ class MainWindow(QMainWindow):
         # SQLite handles multiple cursors on one connection fine for
         # our access pattern.
         self._con = open_db(db_path)
-        # Backfill any event_types added after the DB was first created
-        # (Lost ball / Won ball were added in a later version). Safe to
-        # run on every startup — INSERT OR IGNORE per row.
+        # Idempotent backfills for additions made after the initial seed:
+        # additional event_types (Lost ball / Won ball) and the
+        # mapped_at_frame column on match_track_to_player. Both safe to
+        # run on every startup.
+        ensure_schema_additions(self._con)
         ensure_event_types(self._con)
         self._db_path = db_path
 
